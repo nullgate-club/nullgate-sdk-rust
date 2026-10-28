@@ -11,7 +11,7 @@
 //!     Uuid::parse_str("11111111-2222-4333-8444-555555555555")?,
 //!     "the exact user agent used by your target transport",
 //! ))?;
-//! for protection in client.find_protections(&page) {
+//! for protection in client.find_protections(&page)? {
 //!     if let Protection::Pixel(pixel) = protection {
 //!         // Fetch this script with your existing target client/cookie jar.
 //!         let script = "caller-fetched source text";
@@ -36,7 +36,7 @@ mod protection;
 mod solution;
 
 pub use client::{ClientBuilder, NullgateClient, Session, SessionOptions};
-pub use discovery::find_protections;
+pub use discovery::{FindOptions, find_protections, find_protections_with_options};
 pub use error::{ApiError, Error, ProtocolError};
 pub use params::{Params, PixelParams, SbsdParams, SensorParams};
 pub use protection::{Page, Pixel, Protection, Sbsd, ScriptReference, Sensor};

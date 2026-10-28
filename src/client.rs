@@ -6,7 +6,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::protection::http_url;
-use crate::{ApiError, Error, Page, Params, Protection, ProtocolError, Solution, find_protections};
+use crate::{
+    ApiError, Error, FindOptions, Page, Params, Protection, ProtocolError, Solution,
+    find_protections, find_protections_with_options,
+};
 
 const BASE_URL: &str = "https://akamai.nullgate.club";
 const ANALYTICS_URL: &str = "https://analytics.nullgate.club";
@@ -75,9 +78,21 @@ impl NullgateClient {
         })
     }
 
-    /// Local synchronous discovery; no network requests occur.
-    pub fn find_protections(&self, page: &Page) -> Vec<Protection> {
+    /// Local synchronous discovery; multiple candidates return an ambiguity error.
+    pub fn find_protections(&self, page: &Page) -> Result<Vec<Protection>, Error> {
         find_protections(page)
+    }
+
+    /// Local discovery with explicit ambiguity handling; no network requests occur.
+    ///
+    /// Use `FindOptions { panic: false }` to retain every candidate and select
+    /// explicitly. This never causes a Rust panic.
+    pub fn find_protections_with_options(
+        &self,
+        page: &Page,
+        options: FindOptions,
+    ) -> Result<Vec<Protection>, Error> {
+        find_protections_with_options(page, options)
     }
 
     /// Deliver a customer report containing only its request ID.

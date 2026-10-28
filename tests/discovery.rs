@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use nullgate_sdk::{
-    Page, Protection, Sbsd,
+    Error, FindOptions, Page, Protection, Sbsd,
     akamai::{abck_counters, is_enough, prepare_inputs},
-    find_protections,
+    find_protections, find_protections_with_options,
 };
 
 const VERSION: &str = "11111111-2222-4333-8444-555555555555";
@@ -14,7 +14,7 @@ fn discovery_preserves_occurrences_queries_bases_and_ambiguous_challenges() {
         "<base href='/assets/'>\n<script>bazadebezolkohpepadr='0012';bazadebezolkohpepadr=\"34\";</script>\n<script src='/akam/13/aB09?x=a%2Fb+z&amp;x=two#ignored'></script>\n<script src='opaque?v={VERSION}&amp;t='></script>\n<script src='collector?raw=%2f&amp;second=+value'></script>\n<script src='collector?raw=%2f&amp;second=+value'></script>"
     );
     let page = Page::new("https://target.example/login/index", html).unwrap();
-    let found = find_protections(&page);
+    let found = find_protections_with_options(&page, FindOptions { panic: false }).unwrap();
     let pixels = found
         .iter()
         .filter_map(|p| match p {
@@ -105,7 +105,8 @@ fn discovery_only_considers_active_same_origin_classic_scripts() {
     ] {
         let found = find_protections(
             &Page::new("https://target.example/login/page", format!("{base}{html}")).unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             found
                 .iter()
@@ -119,7 +120,29 @@ fn discovery_only_considers_active_same_origin_classic_scripts() {
 #[test]
 fn assets_and_ambiguous_sbsd_are_not_relabelled_as_sensors() {
     let page = Page::new("https://target.example/", format!("<script src='/app.js'></script><script src='/app.JS?x=2'></script><script src='/app.mjs'></script><script src='/app.cjs'></script><script src='/app%2Ejs'></script><script src='/duplicate?v={VERSION}&amp;v={VERSION}'></script><script src='/tokens?v={VERSION}&amp;t=one&amp;t=two'></script><script src='/akam/13/abc'></script>")).unwrap();
-    assert!(find_protections(&page).is_empty());
+    assert!(find_protections(&page).unwrap().is_empty());
+}
+
+#[test]
+fn discovery_rejects_multiple_candidates_without_selecting_or_deduplicating() {
+    for html in [
+        "<script src='/same'></script><script src='/same'></script>".to_owned(),
+        "<script src='/one'></script><script src='/two'></script>".to_owned(),
+        format!("<script src='/sensor'></script><script src='/sbsd?v={VERSION}'></script>"),
+        "<script>bazadebezolkohpepadr='12';bazadebezolkohpepadr='34';</script>\
+         <script src='/akam/13/abc'></script>"
+            .to_owned(),
+    ] {
+        let page = Page::new("https://target.example/", html).unwrap();
+        assert!(matches!(
+            find_protections(&page),
+            Err(Error::AmbiguousProtections { count: 2 })
+        ));
+        assert!(matches!(
+            find_protections_with_options(&page, FindOptions::default()),
+            Err(Error::AmbiguousProtections { count: 2 })
+        ));
+    }
 }
 
 #[test]

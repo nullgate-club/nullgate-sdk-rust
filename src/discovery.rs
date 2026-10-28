@@ -6,7 +6,7 @@ use regex::Regex;
 use uuid::Uuid;
 
 use crate::protection::Script;
-use crate::{Page, Pixel, Protection, Sbsd, ScriptReference, Sensor};
+use crate::{Error, Page, Pixel, Protection, Sbsd, ScriptReference, Sensor};
 
 static CHALLENGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\bbazadebezolkohpepadr\s*=\s*(?:'([0-9]+)'|"([0-9]+)")"#)
@@ -15,12 +15,47 @@ static CHALLENGE: LazyLock<Regex> = LazyLock::new(|| {
 static PIXEL_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/akam/13/[0-9a-fA-F]+$").expect("constant pixel path pattern"));
 
+/// Options for local protection discovery.
+#[derive(Clone, Copy, Debug)]
+pub struct FindOptions {
+    /// Return an ambiguity error when more than one candidate is found.
+    ///
+    /// Defaults to `true`. This never causes a Rust panic.
+    pub panic: bool,
+}
+
+impl Default for FindOptions {
+    fn default() -> Self {
+        Self { panic: true }
+    }
+}
+
 /// Discover active, same-origin classic scripts without fetching or executing code.
 ///
-/// Every source occurrence and every distinct pixel challenge pairing is retained.
-/// A sensor is the proven extensionless-script heuristic, not a claim about source
-/// contents. Filter the returned enum variants with ordinary iterator operations.
-pub fn find_protections(page: &Page) -> Vec<Protection> {
+/// Returns an empty list for no match and a single-element list for one match.
+/// More than one candidate returns [`Error::AmbiguousProtections`]. A sensor is
+/// the extensionless-script heuristic, not a claim about source contents.
+pub fn find_protections(page: &Page) -> Result<Vec<Protection>, Error> {
+    find_protections_with_options(page, FindOptions::default())
+}
+
+/// Discover protections with explicit ambiguity handling.
+///
+/// With `FindOptions { panic: false }`, every source occurrence and distinct
+/// pixel challenge pairing is retained, in document order, with its provenance.
+/// Select the intended candidate using ordinary iterator operations.
+pub fn find_protections_with_options(
+    page: &Page,
+    options: FindOptions,
+) -> Result<Vec<Protection>, Error> {
+    let found = collect_protections(page);
+    if options.panic && found.len() > 1 {
+        return Err(Error::AmbiguousProtections { count: found.len() });
+    }
+    Ok(found)
+}
+
+fn collect_protections(page: &Page) -> Vec<Protection> {
     let html = page.html();
     let mut line_offsets = vec![0];
     line_offsets.extend(html.match_indices('\n').map(|(offset, _)| offset + 1));

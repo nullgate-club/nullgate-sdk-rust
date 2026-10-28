@@ -22,7 +22,10 @@ from public GitHub, not released to crates.io.
 ## Generate a target POST
 
 ```rust,no_run
-use nullgate_sdk::{NullgateClient, Page, Params, Protection, SensorParams, SessionOptions};
+use nullgate_sdk::{
+    NullgateClient, Page, Params, PixelParams, Protection, SbsdParams, SensorParams,
+    SessionOptions,
+};
 use uuid::Uuid;
 
 async fn generate(html: String, script: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -36,23 +39,19 @@ async fn generate(html: String, script: String) -> Result<(), Box<dyn std::error
         "the exact user agent configured on your target client",
     ))?;
 
-    let sensors = client.find_protections(&page).into_iter().filter_map(|candidate| {
-        match candidate {
-            Protection::Sensor(sensor) => Some(sensor),
-            _ => None,
-        }
-    }).collect::<Vec<_>>();
-    if sensors.len() != 1 {
-        return Err("select the intended sensor explicitly when discovery is ambiguous".into());
+    if let Some(protection) = client.find_protections(&page)?.into_iter().next() {
+        // Fetch `script` from protection.script_url() with your target client.
+        let params = match protection {
+            Protection::Pixel(pixel) => Params::Pixel(PixelParams::new(pixel, script)?),
+            Protection::Sensor(sensor) => {
+                Params::Sensor(SensorParams::new(sensor, script)?)
+            }
+            Protection::Sbsd(sbsd) => Params::Sbsd(SbsdParams::new(sbsd, script)?),
+        };
+        let solution = session.solve(params).await?;
+        solution.wait().await?;
+        // POST solution.body() unchanged to solution.url(), with solution.headers().
     }
-    let sensor = sensors.into_iter().next().ok_or("missing sensor")?;
-    // Fetch `script` from sensor.script_url() using your existing target client.
-    let params = SensorParams::new(sensor, script)?;
-    let solution = session.solve(Params::Sensor(params)).await?;
-    solution.wait().await?;
-    // POST solution.body() unchanged to solution.url(), with solution.headers().
-    // On an observed target rejection, solution.report().await? delivers only
-    // its diagnostic request ID; true does not mean acceptance or a refund.
     Ok(())
 }
 ```
@@ -69,7 +68,24 @@ navigation; never reuse document state for a different page.
 
 `Error::Api` exposes status, server detail, and the response request ID through accessors. Debug/Display omit raw service detail, keys, HTML, scripts, and cookies. Malformed successful responses return `Error::Protocol`; no default solution is invented. Reports contain only `{request_id}`, use a three-second timeout, and never send API authentication, state, or target cookies. Redirects/retries are disabled. Cancellation is ordinary future cancellation, not successful delivery.
 
-Discovery is local and synchronous. It retains candidates, duplicate source occurrences, original query strings, source locations, and every ambiguous pixel challenge pairing. Sensor discovery is the same-origin, extensionless classic-script heuristic, not source-content verification. SBSD blocking means the raw `t` parameter is present, including `t=`. `akamai::is_enough(cookie, response_count)` closes the ordinary sensor-send gate, not an application-specific acceptance test.
+Discovery is local and synchronous. `find_protections(&page)?` returns an empty
+list for no match, a single-element list for one match, and
+`Error::AmbiguousProtections { count }` for multiple candidates. It never panics.
+To inspect or filter an ambiguous page explicitly, use:
+
+```rust,ignore
+let candidates = client.find_protections_with_options(
+    &page,
+    nullgate_sdk::FindOptions { panic: false },
+)?;
+```
+
+The standalone `find_protections_with_options` function accepts the same options.
+Opting out retains every candidate, duplicate source occurrence, original query,
+source location, and distinct pixel challenge pairing; nothing is silently
+selected or deduplicated. Sensor discovery is the same-origin, extensionless
+classic-script heuristic, not source-content verification. SBSD blocking means
+the raw `t` parameter is present, including `t=`.
 
 ## Runnable target example
 
@@ -80,12 +96,25 @@ git clone https://github.com/nullgate-club/nullgate-sdk-rust.git
 cd nullgate-sdk-rust
 export TARGET_URL='https://your-target.example/'
 export NULLGATE_API_KEY='your ng_ credential'
+export NULLGATE_BASE_URL='https://your-updated-nullgate.example/'
 cargo run --example target
 ```
 
-Optional environment variables: `NULLGATE_IDENTITY` (UUID; otherwise random and printed for reuse), `TARGET_PROXY` (HTTP/SOCKS URL), `NULLGATE_BASE_URL`, and `ANALYTICS_URL`. The last two allow isolated local-backend runs.
+`TARGET_URL` and `NULLGATE_API_KEY` are required. Set `NULLGATE_BASE_URL` for the
+updated staging or local backend. Optional `NULLGATE_IDENTITY` reuses a UUID;
+otherwise the example creates and prints a fresh one. `ANALYTICS_URL` is optional.
+The same native jar handles page/script/POST cookies. Only script-visible
+`_abck`/`bm_sz` cookies are sent for Sensor, and `bm_so`/`sbsd_o` for SBSD; unrelated
+target cookies stay local.
 
-The example fetches page/script with one target client, generates, waits, and posts the exact body and headers. It re-fetches the original page after blocking SBSD and diagnoses persistent blocking instead of treating POST 200 as clearance. Sensor continuation follows the cookie gate with finite diagnostic ceilings, never a fixed number of submissions claimed as acceptance. A target 403 is a rejection signal, not proof of a generation defect. Verify your own application-specific outcome.
+The example performs one page GET, local discovery, one script GET, one
+generation, a deadline wait, and one exact POST, then prints the response.
+One POST is not a clearance claim. If the target needs another generation, read
+the updated cookies and solve again in the same document session.
+`akamai::is_enough(cookie, response_count)` describes the ordinary sensor-send
+gate, not website acceptance. A new document needs a fresh session. Report an
+observed rejection with `solution.report().await?`; it sends only the request ID
+and makes no refund or acceptance promise.
 
 ## Quality and package checks
 
@@ -99,4 +128,4 @@ The gate runs rustfmt, Clippy with warnings denied, protocol/discovery/ownership
 
 Standalone CI uses Rust 1.98 with rustfmt and Clippy, installs the native example
 build prerequisites, then runs `make setup` and `make check`. Canonical SDK-first
-documentation: [docs.nullgate.club](https://docs.nullgate.club).
+documentation: [Quickstart](https://docs.nullgate.club/en/quickstart).

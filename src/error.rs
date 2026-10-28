@@ -2,10 +2,15 @@ use std::{error::Error as StdError, fmt};
 
 use serde_json::Value;
 
-/// A checked configuration, transport, service, or response-protocol failure.
+/// A checked configuration, discovery, transport, service, or protocol failure.
 pub enum Error {
     /// Invalid caller configuration or an invalid checked value.
     Configuration(&'static str),
+    /// Local discovery found more than one candidate.
+    AmbiguousProtections {
+        /// Number of candidates retained by discovery.
+        count: usize,
+    },
     /// The Nullgate service returned a non-success HTTP status.
     Api(ApiError),
     /// A successful HTTP response did not satisfy the generation contract.
@@ -112,6 +117,10 @@ impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration(message) => f.debug_tuple("Configuration").field(message).finish(),
+            Self::AmbiguousProtections { count } => f
+                .debug_struct("AmbiguousProtections")
+                .field("count", count)
+                .finish(),
             Self::Api(error) => fmt::Debug::fmt(error, f),
             Self::Protocol(error) => fmt::Debug::fmt(error, f),
             Self::Transport(_) => f.write_str("Transport(Nullgate request failed)"),
@@ -123,6 +132,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration(message) => write!(f, "Invalid Nullgate configuration: {message}"),
+            Self::AmbiguousProtections { count } => write!(
+                f,
+                "Found {count} protection candidates; use FindOptions {{ panic: false }} to select explicitly"
+            ),
             Self::Api(error) => fmt::Display::fmt(error, f),
             Self::Protocol(error) => fmt::Display::fmt(error, f),
             Self::Transport(_) => f.write_str("Nullgate API transport failed"),
@@ -136,7 +149,7 @@ impl StdError for Error {
             Self::Api(error) => Some(error),
             Self::Protocol(error) => Some(error),
             Self::Transport(error) => Some(error),
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::AmbiguousProtections { .. } => None,
         }
     }
 }
