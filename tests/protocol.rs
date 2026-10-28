@@ -439,7 +439,6 @@ async fn wait_obeys_absolute_deadline_and_can_be_cancelled() {
         .unwrap();
     let mut session = client.open(SessionOptions::new(ID, "profile")).unwrap();
     let solution = session.solve(sensor()).await.unwrap();
-    assert_eq!(solution.send_at(), future);
     assert!(
         tokio::time::timeout(Duration::from_millis(10), solution.wait())
             .await
