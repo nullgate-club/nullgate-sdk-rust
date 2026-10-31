@@ -163,7 +163,7 @@ fn threatmetrix_cross_origin_detection_preserves_document_and_provider_ambiguity
     assert_eq!(protection.page().document_id(), page.document_id());
     assert_eq!(protection.page().started_at_ms(), page.started_at_ms());
     assert_eq!(
-        protection.tags_url().as_str(),
+        protection.tags_url().unwrap().as_str(),
         "https://signals.example/fp/tags.js?org_id=org&session_id=session%2Fone"
     );
     assert_eq!(protection.provenance().unwrap().tag_index, 0);

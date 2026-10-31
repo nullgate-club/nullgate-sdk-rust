@@ -224,10 +224,21 @@ impl Sbsd {
     }
 }
 
-/// A ThreatMetrix tags URL carrying its source-owned organization and session IDs.
-#[derive(Clone, Debug)]
+/// A validated ThreatMetrix tags entry or explicitly identified direct collector.
+#[derive(Clone)]
 pub struct ThreatMetrix {
     pub(crate) script: Script,
+    pub(crate) source: ThreatMetrixSource,
+}
+
+#[derive(Clone)]
+pub(crate) enum ThreatMetrixSource {
+    Tags,
+    Collector {
+        url: String,
+        org_id: String,
+        session_id: String,
+    },
 }
 
 impl ThreatMetrix {
@@ -249,6 +260,57 @@ impl ThreatMetrix {
                 url,
                 provenance: None,
             },
+            source: ThreatMetrixSource::Tags,
+        })
+    }
+
+    /// Use the caller's absolute collector URL and explicit, source-owned IDs.
+    ///
+    /// The URL is sent unchanged. No query parameters or wrapper scripts are parsed.
+    pub fn collector(
+        page: Page,
+        collector_url: &str,
+        org_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let (scheme, rest) = collector_url
+            .split_once("://")
+            .ok_or(Error::Configuration("invalid ThreatMetrix collector URL"))?;
+        let authority = rest.split(['/', '?']).next().unwrap_or("");
+        if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+            || authority.is_empty()
+            || authority.contains('@')
+            || authority.ends_with(':')
+            || collector_url.contains(['#', '\\'])
+            || collector_url
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_ascii_control())
+        {
+            return Err(Error::Configuration("invalid ThreatMetrix collector URL"));
+        }
+        let url = http_url(collector_url)?;
+        let org_id = org_id.into();
+        let session_id = session_id.into();
+        if org_id.trim().is_empty()
+            || session_id.trim().is_empty()
+            || org_id.contains(['\r', '\n'])
+            || session_id.contains(['\r', '\n'])
+        {
+            return Err(Error::Configuration(
+                "ThreatMetrix collector requires nonempty org_id and session_id without CR/LF",
+            ));
+        }
+        Ok(Self {
+            script: Script {
+                page,
+                url,
+                provenance: None,
+            },
+            source: ThreatMetrixSource::Collector {
+                url: collector_url.to_owned(),
+                org_id,
+                session_id,
+            },
         })
     }
 
@@ -257,14 +319,27 @@ impl ThreatMetrix {
         &self.script.page
     }
 
-    /// Resolved actual tags URL, including its original query string.
-    pub fn tags_url(&self) -> &Url {
+    /// Parsed entry URL. Direct collectors retain the original URL text on the wire.
+    pub fn script_url(&self) -> &Url {
         &self.script.url
+    }
+
+    /// Resolved actual tags URL, or `None` for a direct collector.
+    pub fn tags_url(&self) -> Option<&Url> {
+        matches!(&self.source, ThreatMetrixSource::Tags).then_some(&self.script.url)
     }
 
     /// Discovery provenance, absent for caller-constructed protections.
     pub fn provenance(&self) -> Option<&ScriptReference> {
         self.script.provenance.as_ref()
+    }
+}
+
+impl fmt::Debug for ThreatMetrix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreatMetrix")
+            .field("script", &self.script)
+            .finish_non_exhaustive()
     }
 }
 
@@ -323,7 +398,7 @@ impl Protection {
             Self::Pixel(p) => p.script_url(),
             Self::Sensor(p) => p.script_url(),
             Self::Sbsd(p) => p.script_url(),
-            Self::ThreatMetrix(p) => p.tags_url(),
+            Self::ThreatMetrix(p) => p.script_url(),
         }
     }
 

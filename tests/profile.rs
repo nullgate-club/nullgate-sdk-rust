@@ -45,7 +45,12 @@ async fn send(socket: &mut Socket, value: Value) {
 }
 
 async fn hello(socket: &mut Socket) {
-    let _ = receive(socket).await;
+    let start = receive(socket).await;
+    assert_eq!(
+        start["tags_url"],
+        "https://signals.example/fp/tags.js?org_id=org&session_id=session"
+    );
+    assert!(start.get("collector").is_none());
     send(
         socket,
         json!({"type":"hello", "state_id":"continued-tmx-state", "request_id":REQUEST_ID}),
@@ -97,6 +102,116 @@ fn params() -> ThreatMetrixParams {
         )
         .unwrap(),
     )
+}
+
+#[tokio::test]
+async fn direct_collector_preserves_explicit_facts_and_parent_document() {
+    const URL: &str = "HTTPS://Signals.Example:443/opaque%2Fcollector?org_id=url-org&session_id=url-session&wenkse=caller%2Fgenerated+value&x=1&x=2";
+    let page = Page::new(
+        "https://target.example/login",
+        "<input type='hidden' name='tmxSessionId' value='site-session/one'>",
+    )
+    .unwrap();
+    let website = json!({
+        "url":page.url().as_str(),
+        "html":page.html(),
+        "document_id":page.document_id(),
+        "started_at_ms":page.started_at_ms(),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let service = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let start = receive(&mut socket).await;
+        assert_eq!(start["website"], website);
+        assert!(start.get("tags_url").is_none());
+        assert_eq!(
+            start["collector"],
+            json!({
+                "url":URL,
+                "org_id":"explicit-org",
+                "session_id":"site-session/one",
+            })
+        );
+        send(
+            &mut socket,
+            json!({"type":"hello", "state_id":"continued-tmx-state", "request_id":REQUEST_ID}),
+        )
+        .await;
+        send(
+            &mut socket,
+            json!({"type":"ready", "request_id":REQUEST_ID}),
+        )
+        .await;
+        send(
+            &mut socket,
+            json!({"type":"collected", "request_id":REQUEST_ID}),
+        )
+        .await;
+        expect_close_without_departure(&mut socket).await;
+    });
+    let sdk = client(&base);
+    let mut session = session(&sdk);
+    let target = Target::new(|_| async { Err::<TargetResponse, _>(()) }, None).unwrap();
+    let collector = ThreatMetrix::collector(page, URL, "explicit-org", "site-session/one").unwrap();
+    assert!(collector.tags_url().is_none());
+    let profile = session
+        .profile(ThreatMetrixParams::new(collector), target)
+        .await
+        .unwrap();
+    profile.wait_collected().await.unwrap();
+    profile.close().await.unwrap();
+    session.close().await.unwrap();
+    sdk.close().await.unwrap();
+    service.await.unwrap();
+}
+
+#[test]
+fn direct_collector_rejects_invalid_facts_before_profile_transport() {
+    let page = Page::new("https://target.example/login", "").unwrap();
+    for url in [
+        "",
+        "/relative",
+        "https:signals.example/collector",
+        "https:///signals.example/collector",
+        "ftp://signals.example/collector",
+        "https://",
+        "https://signals.example:/collector",
+        "https://signals.example:bad/collector",
+        "https://signals.example:65536/collector",
+        "https://@signals.example/collector",
+        "https://private-user:private-password@signals.example/collector",
+        "https://signals.example/collector#",
+        "https://signals.example/collector#fragment",
+        " https://signals.example/collector",
+        "https://signals.example/collector ",
+        "https://signals.example/collect\nor",
+        "https://signals.example/collect\tor",
+        "https://signals.example\\collector",
+    ] {
+        let error = ThreatMetrix::collector(page.clone(), url, "org", "session").unwrap_err();
+        assert!(matches!(error, Error::Configuration(_)), "{url:?}");
+        assert!(!format!("{error:?} {error}").contains("private-password"));
+    }
+    for (org_id, session_id) in [
+        ("", "session"),
+        ("org", ""),
+        (" \t", "session"),
+        ("org", "\u{2003}"),
+        ("private-org\rvalue", "session"),
+        ("org", "private-session\nvalue"),
+    ] {
+        let error = ThreatMetrix::collector(
+            page.clone(),
+            "https://signals.example/collector",
+            org_id,
+            session_id,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Configuration(_)));
+        assert!(!format!("{error:?} {error}").contains("private-"));
+    }
 }
 
 fn http(id: i64, role: &str, body: Value, credentials: &str) -> Value {

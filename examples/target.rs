@@ -2,7 +2,7 @@ use std::{env, error::Error, sync::Arc, time::Duration};
 
 use nullgate_sdk::{
     Credentials, NullgateClient, Page, Params, PixelParams, Protection, SbsdParams, SensorParams,
-    SessionOptions, Target, TargetRequest, TargetResponse, ThreatMetrixParams,
+    SessionOptions, Target, TargetRequest, TargetResponse, ThreatMetrix, ThreatMetrixParams,
 };
 use uuid::Uuid;
 use wreq::{Client, Proxy, cookie::Jar};
@@ -14,6 +14,19 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let target_url = env::var("TARGET_URL")?;
+    let collector = match (
+        env::var("TMX_COLLECTOR_URL"),
+        env::var("TMX_ORG_ID"),
+        env::var("TMX_SESSION_ID"),
+    ) {
+        (
+            Err(env::VarError::NotPresent),
+            Err(env::VarError::NotPresent),
+            Err(env::VarError::NotPresent),
+        ) => None,
+        (Ok(url), Ok(org_id), Ok(session_id)) => Some((url, org_id, session_id)),
+        _ => return Err("set TMX_COLLECTOR_URL, TMX_ORG_ID and TMX_SESSION_ID together".into()),
+    };
     let proxy = match env::var("TARGET_PROXY") {
         Ok(value) => Some(value).filter(|value| !value.is_empty()),
         Err(env::VarError::NotPresent) => None,
@@ -67,7 +80,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let page = Page::new(&page_url, response.text().await?)?;
     let mut session = sdk.open(SessionOptions::new(identity, USER_AGENT))?;
 
-    for protection in sdk.find_protections(&page)? {
+    let protections =
+        match collector {
+            Some((url, org_id, session_id)) => vec![Protection::ThreatMetrix(
+                ThreatMetrix::collector(page.clone(), &url, org_id, session_id)?,
+            )],
+            None => sdk.find_protections(&page)?,
+        };
+    for protection in protections {
         if let Protection::ThreatMetrix(threatmetrix) = &protection {
             let profile = session
                 .profile(

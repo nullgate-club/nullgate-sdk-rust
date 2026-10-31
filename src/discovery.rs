@@ -5,7 +5,7 @@ use percent_encoding::percent_decode_str;
 use regex::Regex;
 use uuid::Uuid;
 
-use crate::protection::{Script, is_threatmetrix_url};
+use crate::protection::{Script, ThreatMetrixSource, is_threatmetrix_url};
 use crate::{Error, Page, Pixel, Protection, Sbsd, ScriptReference, Sensor, ThreatMetrix};
 
 static CHALLENGE: LazyLock<Regex> = LazyLock::new(|| {
@@ -174,6 +174,7 @@ fn collect_protections(page: &Page) -> Vec<Protection> {
                     url,
                     provenance: Some(reference),
                 },
+                source: ThreatMetrixSource::Tags,
             }));
             continue;
         }

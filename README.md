@@ -91,8 +91,51 @@ the raw `t` parameter is present, including `t=`.
 ## Profile ThreatMetrix
 
 Pass the detected `ThreatMetrix` to `ThreatMetrixParams::new`, then call
-`session.profile(params, target).await?`. `Target::new(fetch, proxy)?` takes your
-async `TargetRequest -> Result<TargetResponse, E>` callback and an explicit local
+`session.profile(params, target).await?`. The existing
+`ThreatMetrix::new(page, tags_url)?` constructor also supports caller-identified
+tags entries, with the same tags/resource discovery behavior.
+
+For a real, caller-generated direct collector URL, supply the organization's and
+site session's explicit IDs instead of a tags URL:
+
+```rust,no_run
+use nullgate_sdk::{
+    Error, Page, Profile, Session, Target, ThreatMetrix, ThreatMetrixParams,
+};
+
+async fn start_collector(
+    session: &mut Session,
+    page: Page,
+    target: Target,
+    collector_url: &str,
+    org_id: &str,
+    session_id: &str,
+) -> Result<Profile, Error> {
+    let collector = ThreatMetrix::collector(page, collector_url, org_id, session_id)?;
+    session.profile(ThreatMetrixParams::new(collector), target).await
+}
+```
+
+The collector URL must be absolute HTTP(S), with a host and valid port, without
+userinfo, a fragment, raw whitespace or backslashes. Its original URL text, path
+and opaque query are sent unchanged. IDs must contain non-whitespace text without
+CR/LF. They are never recovered from query names, wrapper JavaScript or source maps.
+The supplied `Page`, HTML and document identity remain the actual page context;
+no synthetic iframe geometry or document URL is substituted.
+Keep the **same session ID in the site's hidden form input**; the SDK does not
+replace it with the service state ID or change the form. This supplies profiling
+facts, not a website-acceptance guarantee.
+
+Each start contains exactly one of `tags_url` or `collector`; a direct entry has
+only `{url, org_id, session_id}` under `collector`, never fake tags.
+`ThreatMetrix::tags_url()` now returns `Option<&Url>`: `Some` for tags, `None`
+for direct collectors. Use `script_url()` for the parsed URL of either entry;
+tags-only callers inspecting `tags_url()` must handle the option.
+Each successfully issued target HTTP command is billed; callbacks, WebSocket
+lifecycle controls and ICE/TURN have no separate charge.
+
+`Target::new(fetch, proxy)?` takes your async
+`TargetRequest -> Result<TargetResponse, E>` callback and an explicit local
 TURN route: `None`/`Some("")` means direct; HTTP CONNECT, HTTPS CONNECT and
 `socks5` URLs mean proxy. TURN endpoints are resolved locally; `socks5h` is
 rejected rather than claiming remote-only DNS. Choose a route with a compatible
@@ -152,6 +195,19 @@ Optional `NULLGATE_IDENTITY` reuses a UUID; otherwise the example creates and pr
 The same native jar handles page/script/POST cookies. Only script-visible
 `_abck`/`bm_sz` cookies are sent for Sensor, and `bm_so`/`sbsd_o` for SBSD; unrelated
 target cookies stay local.
+
+To select explicit direct profiling instead of discovery, set all three collector
+facts:
+
+```sh
+export TMX_COLLECTOR_URL='https://signals.example/collector?wenkse=caller-generated-value'
+export TMX_ORG_ID='the-site-org'
+export TMX_SESSION_ID='the-same-session-id-written-to-the-form'
+cargo run --example target
+```
+
+No collector URL or ID is extracted from the page; generate these values using
+the site's real integration. With no collector facts, ordinary discovery is unchanged.
 
 For Akamai, the example performs one page GET, local discovery, one script GET,
 one generation, a deadline wait, and one exact POST, then prints the response.

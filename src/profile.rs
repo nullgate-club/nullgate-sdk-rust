@@ -29,6 +29,7 @@ use crate::{
     ThreatMetrix,
     akamai::{PreparedInput, prepare_inputs},
     params::validate_actions,
+    protection::ThreatMetrixSource,
     turn_transport::{self, IceServer},
 };
 
@@ -45,7 +46,7 @@ pub struct ThreatMetrixParams {
 }
 
 impl ThreatMetrixParams {
-    /// Retain the detected protection and its original document observation.
+    /// Retain the selected tags entry or direct collector and its document observation.
     pub fn new(protection: ThreatMetrix) -> Self {
         Self {
             protection,
@@ -360,9 +361,24 @@ pub(crate) async fn begin(
             "type":"start",
             "at_ms":observed_at_ms,
             "website":{"url":page.url().as_str(), "html":page.html(), "document_id":page.document_id(), "started_at_ms":page.started_at_ms()},
-            "tags_url":protection.tags_url().as_str(),
             "timezone":connection.timezone,
         });
+        match &protection.source {
+            ThreatMetrixSource::Tags => {
+                start["tags_url"] = json!(protection.script_url().as_str());
+            }
+            ThreatMetrixSource::Collector {
+                url,
+                org_id,
+                session_id,
+            } => {
+                start["collector"] = json!({
+                    "url":url,
+                    "org_id":org_id,
+                    "session_id":session_id,
+                });
+            }
+        }
         if let Some(inputs) = &params.inputs {
             start["inputs"] = json!(inputs);
         }
