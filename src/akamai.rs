@@ -15,6 +15,15 @@ pub struct InputValue {
     pub hash: String,
     /// Total, special, ASCII-letter-after-lowercasing, and ASCII-digit counts.
     pub counts: [usize; 4],
+    /// Signed JavaScript rolling hash used for value-change comparisons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash31: Option<i32>,
+    /// Rolling hash after ECMAScript whitespace trimming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trimmed_hash31: Option<i32>,
+    /// Trimmed UTF-16 length; zero distinguishes empty values from hash collisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trimmed_length: Option<usize>,
 }
 
 /// Field attributes and a summary; never the caller's raw password/value.
@@ -43,9 +52,31 @@ pub fn prepare_inputs(inputs: &[BTreeMap<String, String>]) -> Vec<PreparedInput>
             let value = field.get("value").map_or("", String::as_str);
             let mut digest = Sha256::new();
             let mut length = 0;
+            let mut hash31 = 0_i32;
+            let mut trimmed_hash31 = 0_i32;
+            let mut trimmed_length = 0;
+            let mut candidate_hash = 0_i32;
+            let mut candidate_length = 0;
+            let mut trim_started = false;
             for unit in value.encode_utf16() {
                 digest.update(unit.to_le_bytes());
                 length += 1;
+                hash31 = hash31.wrapping_mul(31).wrapping_add(i32::from(unit));
+                // ECMAScript trim characters are BMP; surrogate units are not whitespace.
+                let whitespace = char::from_u32(u32::from(unit)).is_some_and(js_whitespace);
+                if !whitespace {
+                    trim_started = true;
+                }
+                if trim_started {
+                    candidate_hash = candidate_hash
+                        .wrapping_mul(31)
+                        .wrapping_add(i32::from(unit));
+                    candidate_length += 1;
+                }
+                if !whitespace {
+                    trimmed_hash31 = candidate_hash;
+                    trimmed_length = candidate_length;
+                }
             }
             let special = value
                 .chars()
@@ -68,6 +99,9 @@ pub fn prepare_inputs(inputs: &[BTreeMap<String, String>]) -> Vec<PreparedInput>
                     length,
                     hash: format!("{:x}", digest.finalize()),
                     counts: [length, special, letters, digits],
+                    hash31: Some(hash31),
+                    trimmed_hash31: Some(trimmed_hash31),
+                    trimmed_length: Some(trimmed_length),
                 },
             }
         })

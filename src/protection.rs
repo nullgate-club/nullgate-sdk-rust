@@ -1,6 +1,11 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use url::Url;
+use uuid::Uuid;
 
 use crate::Error;
 
@@ -11,14 +16,23 @@ pub struct Page(Arc<PageData>);
 struct PageData {
     url: Url,
     html: String,
+    document_id: Uuid,
+    started_at_ms: u64,
 }
 
 impl Page {
-    /// Construct an absolute HTTP(S) page. No network request is made.
+    /// Observe a new absolute HTTP(S) document. No network request is made.
     pub fn new(url: &str, html: impl Into<String>) -> Result<Self, Error> {
         Ok(Self(Arc::new(PageData {
             url: http_url(url)?,
             html: html.into(),
+            document_id: Uuid::new_v4(),
+            started_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| Error::Configuration("system clock is before the Unix epoch"))?
+                .as_millis()
+                .try_into()
+                .map_err(|_| Error::Configuration("document timestamp exceeds u64 milliseconds"))?,
         })))
     }
 
@@ -30,6 +44,16 @@ impl Page {
     /// Original caller-provided HTML.
     pub fn html(&self) -> &str {
         &self.0.html
+    }
+
+    /// Identity of this document observation, preserved by clones and discovery.
+    pub fn document_id(&self) -> Uuid {
+        self.0.document_id
+    }
+
+    /// Acquisition time in UTC Unix milliseconds, preserved with the document.
+    pub fn started_at_ms(&self) -> u64 {
+        self.0.started_at_ms
     }
 }
 
@@ -200,6 +224,75 @@ impl Sbsd {
     }
 }
 
+/// A ThreatMetrix tags URL carrying its source-owned organization and session IDs.
+#[derive(Clone, Debug)]
+pub struct ThreatMetrix {
+    pub(crate) script: Script,
+}
+
+impl ThreatMetrix {
+    /// Resolve the actual tags URL against this document and validate its parameters.
+    pub fn new(page: Page, tags_url: &str) -> Result<Self, Error> {
+        let mut url = page
+            .url()
+            .join(tags_url)
+            .map_err(|_| Error::Configuration("invalid ThreatMetrix tags URL"))?;
+        url.set_fragment(None);
+        if !is_threatmetrix_url(&url) {
+            return Err(Error::Configuration(
+                "ThreatMetrix tags URL requires one nonempty org_id and session_id",
+            ));
+        }
+        Ok(Self {
+            script: Script {
+                page,
+                url,
+                provenance: None,
+            },
+        })
+    }
+
+    /// Original document observation.
+    pub fn page(&self) -> &Page {
+        &self.script.page
+    }
+
+    /// Resolved actual tags URL, including its original query string.
+    pub fn tags_url(&self) -> &Url {
+        &self.script.url
+    }
+
+    /// Discovery provenance, absent for caller-constructed protections.
+    pub fn provenance(&self) -> Option<&ScriptReference> {
+        self.script.provenance.as_ref()
+    }
+}
+
+pub(crate) fn is_threatmetrix_url(url: &Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !url.path().ends_with("/tags.js")
+    {
+        return false;
+    }
+    let mut org = None;
+    let mut session = None;
+    for (key, value) in url.query_pairs() {
+        let slot = match key.as_ref() {
+            "org_id" => &mut org,
+            "session_id" => &mut session,
+            _ => continue,
+        };
+        if slot.is_some() || value.is_empty() {
+            return false;
+        }
+        *slot = Some(value);
+    }
+    org.is_some() && session.is_some()
+}
+
 /// Actual supported protection variants; discovery never invents a solver.
 #[derive(Clone, Debug)]
 pub enum Protection {
@@ -209,6 +302,8 @@ pub enum Protection {
     Sensor(Sensor),
     /// SBSD protection.
     Sbsd(Sbsd),
+    /// ThreatMetrix profiling; use `Session::profile`, not `Session::solve`.
+    ThreatMetrix(ThreatMetrix),
 }
 
 impl Protection {
@@ -218,6 +313,7 @@ impl Protection {
             Self::Pixel(p) => p.page(),
             Self::Sensor(p) => p.page(),
             Self::Sbsd(p) => p.page(),
+            Self::ThreatMetrix(p) => p.page(),
         }
     }
 
@@ -227,6 +323,7 @@ impl Protection {
             Self::Pixel(p) => p.script_url(),
             Self::Sensor(p) => p.script_url(),
             Self::Sbsd(p) => p.script_url(),
+            Self::ThreatMetrix(p) => p.tags_url(),
         }
     }
 
@@ -236,6 +333,7 @@ impl Protection {
             Self::Pixel(p) => p.provenance(),
             Self::Sensor(p) => p.provenance(),
             Self::Sbsd(p) => p.provenance(),
+            Self::ThreatMetrix(p) => p.provenance(),
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Typed asynchronous Nullgate generation, without owning the target transport.
+//! Typed asynchronous Nullgate generation and active ThreatMetrix profiling.
 //!
 //! ```no_run
 //! use nullgate_sdk::{NullgateClient, Page, Params, PixelParams, Protection, SessionOptions};
@@ -26,18 +26,27 @@
 //! Use a Tokio runtime for asynchronous I/O. Client, sessions, and solutions keep
 //! the pooled transport alive through ordinary ownership/Drop. A mutable session
 //! prevents overlapping generations; open separate sessions for parallel work.
+//! Use [`Session::profile`] for ThreatMetrix. The caller's [`Target`] owns target
+//! HTTP and its explicit local TURN route; no collector executes in this SDK.
+//! Keep the returned [`Profile`] until actual departure, call `pagehide`
+//! explicitly, and await `close` for resource cleanup without invented departure.
 
 pub mod akamai;
 mod client;
 mod discovery;
 mod error;
 mod params;
+mod profile;
 mod protection;
 mod solution;
+mod target;
+mod turn_transport;
 
 pub use client::{ClientBuilder, NullgateClient, Session, SessionOptions};
 pub use discovery::{FindOptions, find_protections, find_protections_with_options};
-pub use error::{ApiError, Error, ProtocolError};
+pub use error::{ApiError, Error, ProfileError, ProfileErrorKind, ProtocolError};
 pub use params::{Params, PixelParams, SbsdParams, SensorParams};
-pub use protection::{Page, Pixel, Protection, Sbsd, ScriptReference, Sensor};
+pub use profile::{Profile, ThreatMetrixParams};
+pub use protection::{Page, Pixel, Protection, Sbsd, ScriptReference, Sensor, ThreatMetrix};
 pub use solution::Solution;
+pub use target::{Credentials, Target, TargetRequest, TargetResponse};

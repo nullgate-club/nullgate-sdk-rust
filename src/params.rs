@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use uuid::Uuid;
 
 use crate::{
     Error, Page, Pixel, Sbsd, Sensor,
@@ -71,20 +72,25 @@ impl SensorParams {
     ///
     /// Input/change values must be prepared summaries, not raw strings.
     pub fn actions(mut self, actions: Vec<Map<String, Value>>) -> Result<Self, Error> {
-        for action in &actions {
-            if matches!(
-                action.get("type").and_then(Value::as_str),
-                Some("input" | "change")
-            ) && action.get("value").is_some_and(Value::is_string)
-            {
-                return Err(Error::Configuration(
-                    "input/change action values must be prepared summaries, not raw strings",
-                ));
-            }
-        }
+        validate_actions(&actions)?;
         self.actions = Some(actions);
         Ok(self)
     }
+}
+
+pub(crate) fn validate_actions(actions: &[Map<String, Value>]) -> Result<(), Error> {
+    for action in actions {
+        if matches!(
+            action.get("type").and_then(Value::as_str),
+            Some("input" | "change")
+        ) && action.get("value").is_some_and(Value::is_string)
+        {
+            return Err(Error::Configuration(
+                "input/change action values must be prepared summaries, not raw strings",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// SBSD source paired only with an SBSD protection.
@@ -174,6 +180,8 @@ pub(crate) struct Payload<'a> {
 struct Website<'a> {
     url: &'a str,
     html: &'a str,
+    document_id: Uuid,
+    started_at_ms: u64,
 }
 #[derive(Serialize)]
 struct Script<'a> {
@@ -222,6 +230,8 @@ impl Params {
             website: Website {
                 url: self.page().url().as_str(),
                 html: self.page().html(),
+                document_id: self.page().document_id(),
+                started_at_ms: self.page().started_at_ms(),
             },
             script: Script {
                 source: self.script_url().as_str(),

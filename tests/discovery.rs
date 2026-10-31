@@ -146,6 +146,59 @@ fn discovery_rejects_multiple_candidates_without_selecting_or_deduplicating() {
 }
 
 #[test]
+fn threatmetrix_cross_origin_detection_preserves_document_and_provider_ambiguity() {
+    let page = Page::new(
+        "https://target.example/login",
+        "<script src='https://signals.example/fp/tags.js?org_id=org&amp;session_id=session%2Fone'></script>\
+         <script src='/collector'></script>",
+    ).unwrap();
+    assert!(matches!(
+        find_protections(&page),
+        Err(Error::AmbiguousProtections { count: 2 })
+    ));
+    let found = find_protections_with_options(&page, FindOptions { panic: false }).unwrap();
+    let Protection::ThreatMetrix(protection) = &found[0] else {
+        panic!("expected TMX protection");
+    };
+    assert_eq!(protection.page().document_id(), page.document_id());
+    assert_eq!(protection.page().started_at_ms(), page.started_at_ms());
+    assert_eq!(
+        protection.tags_url().as_str(),
+        "https://signals.example/fp/tags.js?org_id=org&session_id=session%2Fone"
+    );
+    assert_eq!(protection.provenance().unwrap().tag_index, 0);
+    assert!(matches!(found[1], Protection::Sensor(_)));
+}
+
+#[test]
+fn threatmetrix_requires_single_nonempty_source_ids_without_site_allowlist() {
+    for query in [
+        "org_id=org",
+        "session_id=session",
+        "org_id=&session_id=session",
+        "org_id=org&session_id=",
+        "org_id=org&org_id=other&session_id=session",
+        "org_id=org&session_id=session&session_id=other",
+    ] {
+        let page = Page::new(
+            "https://target.example/",
+            format!("<script src='https://any.example/tags.js?{query}'></script>"),
+        )
+        .unwrap();
+        assert!(find_protections(&page).unwrap().is_empty(), "{query}");
+    }
+    let page = Page::new(
+        "https://target.example/",
+        "<script src='//any.example/tags.js?org_id=org&amp;session_id=session'></script>",
+    )
+    .unwrap();
+    assert!(matches!(
+        find_protections(&page).unwrap().as_slice(),
+        [Protection::ThreatMetrix(_)]
+    ));
+}
+
+#[test]
 fn sbsd_uses_raw_query_presence_even_when_t_is_empty() {
     let page = Page::new("https://target.example/", "").unwrap();
     for suffix in ["t", "t=", "t=opaque%2Ftoken+part"] {
@@ -195,6 +248,54 @@ fn input_summaries_follow_javascript_utf16_and_whitespace_categories() {
         prepared[2].value.hash,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
+}
+
+#[test]
+fn input_hash_facts_match_ecmascript_trim_and_utf16() {
+    // Expected facts come from native String.trim, charCodeAt and Math.imul.
+    let cases = [
+        ("", 0, 0, 0),
+        ("A_9 😀İ\u{a0}", -902_761_640, 386_520_648, 7),
+        ("\u{85}\u{feff}", 69_402, 133, 1),
+        (
+            "\u{feff}\u{a0}😀 \u{85}\tX\u{3000}\u{feff}",
+            -2_113_306_057,
+            927_999_095,
+            6,
+        ),
+        (
+            concat!(
+                "\t\n\u{b}\u{c}\r \u{a0}\u{1680}\u{2000}\u{2001}\u{2002}",
+                "\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}",
+                "\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}",
+            ),
+            -1_202_517_248,
+            0,
+            0,
+        ),
+        (" \0 ", 30_784, 0, 1),
+        ("\u{180e}x\u{200b}", 5_929_761, 5_929_761, 3),
+        (
+            "abcdefghijklmnopqrstuvwxyz😀",
+            1_546_828_752,
+            1_546_828_752,
+            28,
+        ),
+        ("\u{85} x \u{85}", 123_898_050, 123_898_050, 5),
+    ];
+    for (index, (value, hash31, trimmed_hash31, trimmed_length)) in cases.into_iter().enumerate() {
+        let prepared = prepare_inputs(&[BTreeMap::from([("value".to_owned(), value.to_owned())])]);
+        let summary = &prepared[0].value;
+        assert_eq!(
+            (
+                summary.hash31,
+                summary.trimmed_hash31,
+                summary.trimmed_length
+            ),
+            (Some(hash31), Some(trimmed_hash31), Some(trimmed_length)),
+            "JavaScript case {index}"
+        );
+    }
 }
 
 #[test]

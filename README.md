@@ -1,12 +1,10 @@
 # Nullgate Rust SDK
 
-An asynchronous, typed client for Nullgate's supported Akamai Pixel, Sensor, and SBSD generation APIs. The SDK contacts Nullgate; your target HTTP transport and cookie jar remain yours.
+An asynchronous, typed client for Nullgate's Akamai Pixel, Sensor and SBSD generation APIs and active ThreatMetrix profiling. The SDK contacts Nullgate; your target HTTP transport, proxy and cookie jar remain yours.
 
-This SDK requires the updated Nullgate backend, including `X-Request-ID` and
-analytics reporting. Until the backend cutover, use `NullgateClient::builder(key)`
-with `.base_url(...)` and `.analytics_url(...)` for an updated preview deployment; the target
-example reads `NULLGATE_BASE_URL` and `ANALYTICS_URL`. It does not support the old
-production API. Python users of that API should stay on the Python SDK's `main`.
+The default endpoints are `https://akamai.nullgate.club` for generation,
+`https://threatmetrix.nullgate.club` for profiling, and
+`https://analytics.nullgate.club` for optional diagnostic reports.
 
 ## Install
 
@@ -29,10 +27,7 @@ use nullgate_sdk::{
 use uuid::Uuid;
 
 async fn generate(html: String, script: String) -> Result<(), Box<dyn std::error::Error>> {
-    let client = NullgateClient::builder(std::env::var("NULLGATE_API_KEY")?)
-        .base_url(std::env::var("NULLGATE_BASE_URL")?)
-        .analytics_url(std::env::var("ANALYTICS_URL")?)
-        .build()?;
+    let client = NullgateClient::new(std::env::var("NULLGATE_API_KEY")?)?;
     let page = Page::new("https://target.example/", html)?;
     let mut session = client.open(SessionOptions::new(
         Uuid::parse_str("11111111-2222-4333-8444-555555555555")?,
@@ -47,6 +42,7 @@ async fn generate(html: String, script: String) -> Result<(), Box<dyn std::error
                 Params::Sensor(SensorParams::new(sensor, script)?)
             }
             Protection::Sbsd(sbsd) => Params::Sbsd(SbsdParams::new(sbsd, script)?),
+            Protection::ThreatMetrix(_) => return Err("use session.profile for ThreatMetrix".into()),
         };
         let solution = session.solve(params).await?;
         solution.wait().await?;
@@ -60,10 +56,15 @@ async fn generate(html: String, script: String) -> Result<(), Box<dyn std::error
 
 Sensor/SBSD `.cookies(BTreeMap<String, String>)` supplies the current target cookie snapshot. Sensor `.inputs(Vec<BTreeMap<String, String>>)` hashes raw values locally using UTF-16 little-endian SHA-256 and sends only summaries. `.actions(Vec<serde_json::Map<String, serde_json::Value>>)?` accepts caller-supplied activity and rejects raw `input`/`change` text before transport; provide prepared summaries instead. Omitted inputs/actions preserve continuation semantics; explicitly empty lists remain empty lists.
 
-A session's mutable borrow prevents overlapping solves. Separate sessions can run concurrently and share the client's pool; state headers never become client-wide defaults. Header rotations are retained even on API/protocol errors. Drop releases resources when the last client, session, or solution handle goes away.
+A session's mutable borrow serializes solves and profile starts. Separate sessions
+can run concurrently and share the client's pool; state headers never become
+client-wide defaults. Rotations are retained even on API/protocol errors. Drop
+cancels owned profiles; explicit `close().await?` waits for cleanup.
 
-Keep the client for your application lifetime and open a fresh session for each
-new document. Reuse the identity and your target provider's cookie jar across
+Keep the client for your application lifetime. For Akamai, open a fresh session
+for each new document. ThreatMetrix can start a new document profile on the same
+session to preserve its service continuation. In either case create a new `Page`
+for each document, and reuse the identity and target provider's cookie jar across
 navigation; never reuse document state for a different page.
 
 `Error::Api` exposes status, server detail, and the response request ID through accessors. Debug/Display omit raw service detail, keys, HTML, scripts, and cookies. Malformed successful responses return `Error::Protocol`; no default solution is invented. Reports contain only `{request_id}`, use a three-second timeout, and never send API authentication, state, or target cookies. Redirects/retries are disabled. Cancellation is ordinary future cancellation, not successful delivery.
@@ -87,6 +88,51 @@ selected or deduplicated. Sensor discovery is the same-origin, extensionless
 classic-script heuristic, not source-content verification. SBSD blocking means
 the raw `t` parameter is present, including `t=`.
 
+## Profile ThreatMetrix
+
+Pass the detected `ThreatMetrix` to `ThreatMetrixParams::new`, then call
+`session.profile(params, target).await?`. `Target::new(fetch, proxy)?` takes your
+async `TargetRequest -> Result<TargetResponse, E>` callback and an explicit local
+TURN route: `None`/`Some("")` means direct; HTTP CONNECT, HTTPS CONNECT and
+`socks5` URLs mean proxy. TURN endpoints are resolved locally; `socks5h` is
+rejected rather than claiming remote-only DNS. Choose a route with a compatible
+endpoint address family. Allocation failures yield missing ICE evidence, never a
+direct fallback or fabricated related address. No proxy URL reaches the service
+or appears in SDK errors. Invalid routes fail before opening a paid profile.
+
+The callback must use the page's User-Agent, TLS client, cookie jar and route.
+`TargetRequest.body` is `Option<Vec<u8>>`: absent and present-empty are distinct.
+Honor `Credentials::Include`/`Omit`; for omit, use your maintained provider's
+fresh per-request cookie jar, never clear or replace the shared jar. Return the
+actual status, headers and raw bytes, including HTTP error responses; do not use
+`error_for_status` or a text decoder. The runnable wreq adapter demonstrates this.
+
+Optional `ThreatMetrixParams::inputs` and `actions` use the existing Sensor
+observation types, local UTF-16 hashing and raw-input rejection. Omitted fields
+are absent from the start frame; an explicitly supplied empty list stays `[]`.
+No automatic keystrokes or activity are generated.
+
+The returned `Profile` means startup is ready, **not** that collectors have
+finished or that the target accepted it. Keep the handle alive while the document
+is active. `profile.wait_collected().await?` observes all installed collector
+lifetimes finishing without closing the socket. On actual departure, call
+`profile.pagehide(None, false).await?`; `None` samples the caller clock and
+`persisted=true` preserves the active handle for a cached document.
+
+`profile.close().await?` cancels work, releases TURN and closes the socket without
+inventing pagehide. Session/client `close().await?` awaits their owned profiles.
+Drop requests cleanup, but explicit close awaits it. `profile.report().await?`
+uses the existing analytics semantics. Service/protocol/transport failures are
+`Error::Profile` with `ProfileErrorKind`, status and request-ID accessors.
+`ClientBuilder::profile_base_url` overrides the profiling endpoint.
+
+The SDK uses `tokio-tungstenite` for WebSocket framing and maintained `turn`
+for Allocate/authentication/refresh. A narrow stream adapter preserves TCP STUN
+and ChannelData records; it does not implement TURN or gather host/UDP candidates.
+TURN control uses TCP through the selected route; the allocation/candidate
+protocol remains UDP. Allocations stay alive until release/close. Provider close
+sends Refresh(0), but does not expose its acknowledgement; deletion is not claimed.
+
 ## Runnable target example
 
 The example uses published **wreq 0.16.1 + wreq-util 0.2.0**, Chrome146/Windows TLS, HTTP/2, client hints and matching user agent, a persistent scope-aware cookie jar, compression, and verified CA roots. These are dev dependencies, not dependencies of SDK consumers. There is no fallback to a standard target transport.
@@ -96,19 +142,22 @@ git clone https://github.com/nullgate-club/nullgate-sdk-rust.git
 cd nullgate-sdk-rust
 export TARGET_URL='https://your-target.example/'
 export NULLGATE_API_KEY='your ng_ credential'
-export NULLGATE_BASE_URL='https://your-updated-nullgate.example/'
 cargo run --example target
 ```
 
-`TARGET_URL` and `NULLGATE_API_KEY` are required. Set `NULLGATE_BASE_URL` for the
-updated staging or local backend. Optional `NULLGATE_IDENTITY` reuses a UUID;
-otherwise the example creates and prints a fresh one. `ANALYTICS_URL` is optional.
+`TARGET_URL` and `NULLGATE_API_KEY` are required. `NULLGATE_BASE_URL`,
+`NULLGATE_PROFILE_BASE_URL` and `ANALYTICS_URL` override the default services for
+local development or staging.
+Optional `NULLGATE_IDENTITY` reuses a UUID; otherwise the example creates and prints one.
 The same native jar handles page/script/POST cookies. Only script-visible
 `_abck`/`bm_sz` cookies are sent for Sensor, and `bm_so`/`sbsd_o` for SBSD; unrelated
 target cookies stay local.
 
-The example performs one page GET, local discovery, one script GET, one
-generation, a deadline wait, and one exact POST, then prints the response.
+For Akamai, the example performs one page GET, local discovery, one script GET,
+one generation, a deadline wait, and one exact POST, then prints the response.
+For ThreatMetrix, it profiles through the same wreq client, explicitly leaves
+the document after startup, then awaits cleanup. Real callers retain the handle
+until their actual departure.
 One POST is not a clearance claim. If the target needs another generation, read
 the updated cookies and solve again in the same document session.
 `akamai::is_enough(cookie, response_count)` describes the ordinary sensor-send

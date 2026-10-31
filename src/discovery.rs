@@ -5,8 +5,8 @@ use percent_encoding::percent_decode_str;
 use regex::Regex;
 use uuid::Uuid;
 
-use crate::protection::Script;
-use crate::{Error, Page, Pixel, Protection, Sbsd, ScriptReference, Sensor};
+use crate::protection::{Script, is_threatmetrix_url};
+use crate::{Error, Page, Pixel, Protection, Sbsd, ScriptReference, Sensor, ThreatMetrix};
 
 static CHALLENGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\bbazadebezolkohpepadr\s*=\s*(?:'([0-9]+)'|"([0-9]+)")"#)
@@ -30,7 +30,7 @@ impl Default for FindOptions {
     }
 }
 
-/// Discover active, same-origin classic scripts without fetching or executing code.
+/// Discover active classic scripts without fetching or executing code.
 ///
 /// Returns an empty list for no match and a single-element list for one match.
 /// More than one candidate returns [`Error::AmbiguousProtections`]. A sensor is
@@ -167,6 +167,16 @@ fn collect_protections(page: &Page) -> Vec<Protection> {
             continue;
         };
         url.set_fragment(None);
+        if is_threatmetrix_url(&url) {
+            found.push(Protection::ThreatMetrix(ThreatMetrix {
+                script: Script {
+                    page: page.clone(),
+                    url,
+                    provenance: Some(reference),
+                },
+            }));
+            continue;
+        }
         if url.origin() != page.url().origin() {
             continue;
         }

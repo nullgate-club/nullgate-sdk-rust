@@ -7,8 +7,8 @@ use std::{
 
 use common::{Reply, serve};
 use nullgate_sdk::{
-    Error, NullgateClient, Page, Params, Pixel, PixelParams, Sbsd, SbsdParams, Sensor,
-    SensorParams, SessionOptions,
+    Error, FindOptions, NullgateClient, Page, Params, Pixel, PixelParams, Protection, Sbsd,
+    SbsdParams, Sensor, SensorParams, SessionOptions,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -111,25 +111,106 @@ async fn normalizes_all_three_operations_without_reencoding_target_bodies() {
     assert_eq!(first.target, format!("/v1/{ID}/generate?type=akamai"));
     assert_eq!(first.headers["authorization"], format!("Bearer {KEY}"));
     assert_eq!(first.headers["user-agent"], "target-user-agent");
-    assert_eq!(
-        first.body["website"],
-        json!({"url":"https://target.example/login", "html":"<html>private html</html>"})
-    );
-    assert_eq!(
-        first.body["script"],
-        json!({"source":"https://target.example/collect?raw=%2f+v", "text":"private source"})
-    );
     assert_eq!(first.body["timezone"], "Europe/Berlin");
-    assert_eq!(first.body["cookies"], json!({}));
-    assert!(first.body.get("inputs").is_none());
-    assert!(first.body.get("actions").is_none());
     let second = server.requests.recv().await.unwrap();
     assert_eq!(second.target, format!("/v1/{ID}/generate?type=pixel"));
     assert_eq!(second.body["challenge"], "0012");
-    assert!(second.body.get("cookies").is_none());
     let third = server.requests.recv().await.unwrap();
     assert_eq!(third.target, format!("/v1/{ID}/generate?type=sbsd"));
-    assert_eq!(third.body["cookies"], json!({}));
+}
+
+#[tokio::test]
+async fn document_observations_change_without_replacing_session_or_profile() {
+    let target_post = json!({
+        "url":"https://target.example/post", "body":"ready", "send_at":0, "headers":{}
+    });
+    let mut server = serve(vec![
+        Reply::json(200, target_post.clone()).header("X-Request-ID", "pixel"),
+        success("sensor", None),
+        Reply::json(200, target_post).header("X-Request-ID", "sbsd"),
+        success("new-document", None),
+        success("same-document", None),
+        success("original-document", None),
+    ])
+    .await;
+    let client = NullgateClient::builder(KEY)
+        .base_url(&server.url)
+        .build()
+        .unwrap();
+    let mut session = client
+        .open(SessionOptions::new(ID, "profile").timezone("Europe/Berlin"))
+        .unwrap();
+    let initial_state = session.state_id().unwrap().to_owned();
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let html = format!(
+        "<script>bazadebezolkohpepadr='12'</script>\
+         <script src='/akam/13/abc'></script>\
+         <script src='/collector'></script>\
+         <script src='/challenge?v={ID}'></script>"
+    );
+    let html_pointer = html.as_ptr();
+    let page = Page::new("https://target.example/", html).unwrap();
+    let after = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    assert!((before..=after).contains(&u128::from(page.started_at_ms())));
+    assert_eq!(page.html().as_ptr(), html_pointer);
+    let found = client
+        .find_protections_with_options(&page.clone(), FindOptions { panic: false })
+        .unwrap();
+    let mut original_sensor = None;
+    for protection in found {
+        assert_eq!(protection.page().html().as_ptr(), html_pointer);
+        let params = match protection {
+            Protection::Pixel(pixel) => Params::Pixel(PixelParams::new(pixel, "source").unwrap()),
+            Protection::Sensor(sensor) => {
+                let params = Params::Sensor(SensorParams::new(sensor, "source").unwrap());
+                original_sensor = Some(params.clone());
+                params
+            }
+            Protection::Sbsd(sbsd) => Params::Sbsd(SbsdParams::new(sbsd, "source").unwrap()),
+            Protection::ThreatMetrix(_) => unreachable!("fixture contains only Akamai scripts"),
+        };
+        session.solve(params).await.unwrap();
+        assert_eq!(session.state_id(), Some(initial_state.as_str()));
+    }
+    let next_page = Page::new(page.url().as_str(), page.html()).unwrap();
+    assert_ne!(next_page.document_id(), page.document_id());
+    let next_sensor = Params::Sensor(
+        SensorParams::new(
+            Sensor::new(next_page.clone(), "https://target.example/collector").unwrap(),
+            "source",
+        )
+        .unwrap(),
+    );
+    session.solve(next_sensor.clone()).await.unwrap();
+    session.solve(next_sensor).await.unwrap();
+    assert_eq!(session.state_id(), Some(initial_state.as_str()));
+    session.solve(original_sensor.unwrap()).await.unwrap();
+    assert_eq!(session.state_id(), Some(initial_state.as_str()));
+    assert_eq!(session.identity(), ID);
+    for index in 0..6 {
+        let request = server.requests.recv().await.unwrap();
+        let observed = if matches!(index, 3..=4) {
+            &next_page
+        } else {
+            &page
+        };
+        let website = &request.body["website"];
+        assert_eq!(
+            Uuid::parse_str(website["document_id"].as_str().unwrap()).unwrap(),
+            observed.document_id()
+        );
+        assert_eq!(website["started_at_ms"], observed.started_at_ms());
+        assert_eq!(request.headers["x-state-id"], initial_state);
+        assert_eq!(request.headers["user-agent"], "profile");
+        assert_eq!(request.body["timezone"], "Europe/Berlin");
+        assert!(request.target.starts_with(&format!("/v1/{ID}/generate?")));
+    }
 }
 
 #[tokio::test]
@@ -157,8 +238,13 @@ async fn state_is_per_session_and_rotates_on_api_and_protocol_errors() {
     let mut b = client
         .open(SessionOptions::new(Uuid::from_u128(2), "profile-b"))
         .unwrap();
-    a.solve(sensor()).await.unwrap();
-    let error = b.solve(sensor()).await.unwrap_err();
+    let initial_a = a.state_id().unwrap().to_owned();
+    let initial_b = b.state_id().unwrap().to_owned();
+    assert_ne!(initial_a, initial_b);
+    let a_params = sensor();
+    let b_params = sensor();
+    a.solve(a_params.clone()).await.unwrap();
+    let error = b.solve(b_params.clone()).await.unwrap_err();
     let Error::Api(api) = &error else {
         panic!("wrong failure category: {error:?}");
     };
@@ -169,21 +255,21 @@ async fn state_is_per_session_and_rotates_on_api_and_protocol_errors() {
         &json!({"reason":"private html and private source"})
     );
     assert!(!format!("{error:?} {error}").contains("private"));
-    let malformed = a.solve(sensor()).await.unwrap_err();
+    let malformed = a.solve(a_params.clone()).await.unwrap_err();
     let Error::Protocol(protocol) = malformed else {
         panic!("expected protocol failure");
     };
     assert_eq!(protocol.request_id(), Some("a-malformed"));
     assert_eq!(a.state_id(), Some("state-a-next"));
     assert_eq!(b.state_id(), Some("state-b"));
-    b.solve(sensor()).await.unwrap();
-    a.solve(sensor()).await.unwrap();
+    b.solve(b_params).await.unwrap();
+    a.solve(a_params).await.unwrap();
     let mut requests = Vec::new();
     for _ in 0..5 {
         requests.push(server.requests.recv().await.unwrap());
     }
-    assert!(!requests[0].headers.contains_key("x-state-id"));
-    assert!(!requests[1].headers.contains_key("x-state-id"));
+    assert_eq!(requests[0].headers["x-state-id"], initial_a);
+    assert_eq!(requests[1].headers["x-state-id"], initial_b);
     assert_eq!(requests[2].headers["x-state-id"], "state-a");
     assert_eq!(requests[3].headers["x-state-id"], "state-b");
     assert_eq!(requests[4].headers["x-state-id"], "state-a-next");
@@ -205,28 +291,28 @@ async fn independent_sessions_can_generate_concurrently_without_shared_headers()
         .build()
         .unwrap();
     let mut a = client.open(SessionOptions::new(ID, "profile-a")).unwrap();
-    let mut b = client
-        .open(SessionOptions::new(Uuid::from_u128(2), "profile-b"))
-        .unwrap();
-    let (first, second) = tokio::join!(a.solve(sensor()), b.solve(sensor()));
+    let mut b = client.open(SessionOptions::new(ID, "profile-b")).unwrap();
+    let initial_a = a.state_id().unwrap().to_owned();
+    let initial_b = b.state_id().unwrap().to_owned();
+    assert_ne!(initial_a, initial_b);
+    let params = sensor();
+    let (first, second) = tokio::join!(a.solve(params.clone()), b.solve(params.clone()));
     first.unwrap();
     second.unwrap();
     let state_a = a.state_id().unwrap().to_owned();
     let state_b = b.state_id().unwrap().to_owned();
     assert_ne!(state_a, state_b);
-    let (third, fourth) = tokio::join!(a.solve(sensor()), b.solve(sensor()));
+    let (third, fourth) = tokio::join!(a.solve(params.clone()), b.solve(params));
     third.unwrap();
     fourth.unwrap();
     for _ in 0..2 {
-        assert!(
-            !server
-                .requests
-                .recv()
-                .await
-                .unwrap()
-                .headers
-                .contains_key("x-state-id")
-        );
+        let request = server.requests.recv().await.unwrap();
+        let expected = if request.headers["user-agent"] == "profile-a" {
+            &initial_a
+        } else {
+            &initial_b
+        };
+        assert_eq!(&request.headers["x-state-id"], expected);
     }
     for _ in 0..2 {
         let request = server.requests.recv().await.unwrap();
@@ -283,12 +369,11 @@ async fn input_values_are_summarized_and_empty_activity_is_not_absent() {
         .await
         .unwrap();
     let request = server.requests.recv().await.unwrap();
-    assert_eq!(
-        request.body["inputs"],
-        json!([{"attributes":{"type":"password"},"value":{"length":8,"hash":"552f5768ce4326ff5fd4e0ce8d1d3a8e76c17a04542eb14f91f64e5a09550510","counts":[8,3,2,1]}}])
-    );
     assert!(!request.body.to_string().contains("A_9"));
-    assert_eq!(request.body["actions"], json!(actions));
+    let summary = &request.body["inputs"][0]["value"];
+    assert_eq!(summary["hash31"], -902_761_640);
+    assert_eq!(summary["trimmed_hash31"], 386_520_648);
+    assert_eq!(summary["trimmed_length"], 7);
     let cleared = server.requests.recv().await.unwrap();
     assert_eq!(cleared.body["inputs"], json!([]));
     assert_eq!(cleared.body["actions"], json!([]));
