@@ -29,8 +29,11 @@ pub struct InputValue {
 /// Field attributes and a summary; never the caller's raw password/value.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PreparedInput {
-    /// All original attributes other than `value`.
+    /// All original attributes other than `value` and `selector`.
     pub attributes: BTreeMap<String, String>,
+    /// Optional CSS selector binding this observation to a single native field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
     /// Locally prepared value summary.
     pub value: InputValue,
 }
@@ -92,9 +95,10 @@ pub fn prepare_inputs(inputs: &[BTreeMap<String, String>]) -> Vec<PreparedInput>
             PreparedInput {
                 attributes: field
                     .iter()
-                    .filter(|(key, _)| key.as_str() != "value")
+                    .filter(|(key, _)| !matches!(key.as_str(), "value" | "selector"))
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
+                selector: field.get("selector").cloned(),
                 value: InputValue {
                     length,
                     hash: format!("{:x}", digest.finalize()),

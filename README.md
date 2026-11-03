@@ -56,6 +56,12 @@ async fn generate(html: String, script: String) -> Result<(), Box<dyn std::error
 
 Sensor/SBSD `.cookies(BTreeMap<String, String>)` supplies the current target cookie snapshot. Sensor `.inputs(Vec<BTreeMap<String, String>>)` hashes raw values locally using UTF-16 little-endian SHA-256 and sends only summaries. `.actions(Vec<serde_json::Map<String, serde_json::Value>>)?` accepts caller-supplied activity and rejects raw `input`/`change` text before transport; provide prepared summaries instead. Omitted inputs/actions preserve continuation semantics; explicitly empty lists remain empty lists.
 
+Each flat input map may include a reserved `selector` CSS selector alongside
+`id`, `name`, and `value`. It is sent as top-level `selector`, never an attribute,
+and omitted when absent. A selector must match exactly one native `input` or
+`textarea`, and any supplied nonempty `id`/`name` must also match. Selector-only
+binding is supported; without a selector, existing id/name binding is unchanged.
+
 A session's mutable borrow serializes solves and profile starts. Separate sessions
 can run concurrently and share the client's pool; state headers never become
 client-wide defaults. Rotations are retained even on API/protocol errors. Drop
