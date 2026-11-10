@@ -548,3 +548,231 @@ fn profiling_raw_input_actions_fail_before_opening_a_paid_profile() {
         assert!(!format!("{error:?} {error}").contains("private-password"));
     }
 }
+
+#[tokio::test]
+async fn error_negotiation_distinguishes_target_502_from_transport_failure() {
+    use std::error::Error as _;
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Callback, ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+    };
+
+    struct CheckErrorFormat;
+    impl Callback for CheckErrorFormat {
+        fn on_request(
+            self,
+            request: &HandshakeRequest,
+            response: HandshakeResponse,
+        ) -> Result<HandshakeResponse, ErrorResponse> {
+            assert_eq!(request.headers()["X-Nullgate-Error-Format"], "1");
+            Ok(response)
+        }
+    }
+    for negotiated in [false, true] {
+        for failed in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let service = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_hdr_async(stream, CheckErrorFormat)
+                    .await
+                    .unwrap();
+                receive(&mut socket).await;
+                let mut greeting =
+                    json!({"type":"hello", "state_id":"continued", "request_id":REQUEST_ID});
+                if negotiated {
+                    greeting["error_format"] = json!(1);
+                }
+                send(&mut socket, greeting).await;
+                send(&mut socket, json!({"type":"http", "id":1, "request":{
+                    "role":"tags", "url":"https://target.example/private?secret=1", "method":"GET",
+                    "headers":{}, "body":null, "credentials":"include"
+                }})).await;
+                let reply = receive(&mut socket).await;
+                assert!(!reply.to_string().contains("private-local"));
+                if failed {
+                    assert_eq!(reply["type"], "http.error");
+                    if negotiated {
+                        assert_eq!(reply["error"]["kind"], "connection");
+                    } else {
+                        assert_eq!(reply.as_object().unwrap().len(), 3);
+                    }
+                } else {
+                    assert_eq!(reply["type"], "http.result");
+                    assert_eq!(reply["response"]["status"], 502);
+                }
+                let mut failure = json!({"type":"error", "status":502, "detail":"private-detail", "request_id":REQUEST_ID});
+                if negotiated && failed {
+                    failure["error"] = json!({"code":"CLIENT_TRANSPORT_ERROR", "origin":"client",
+                        "message":"Target request failed", "retryable":null, "stage":"target_http", "command_id":1,
+                        "target":{"role":"tags", "method":"GET", "host":"target.example"},
+                        "cause":{"kind":"connection"}});
+                }
+                send(&mut socket, failure).await;
+                expect_close_without_departure(&mut socket).await;
+            });
+            let sdk = client(&base);
+            let mut session = session(&sdk);
+            let target = Target::new(
+                move |_| async move {
+                    if failed {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "private-local https://user:private-password@proxy.example/path?private-token=secret",
+                        ))
+                    } else {
+                        Ok(TargetResponse {
+                            status: 502,
+                            headers: BTreeMap::new(),
+                            body: vec![],
+                        })
+                    }
+                },
+                None,
+            )
+            .unwrap();
+            let error = session.profile(params(), target).await.unwrap_err();
+            let Error::Profile(failure) = &error else {
+                panic!("lost service category");
+            };
+            assert_eq!(failure.status(), Some(502));
+            if negotiated && failed {
+                let info = failure.error_info().unwrap();
+                assert_eq!(info.code, "CLIENT_TRANSPORT_ERROR");
+                assert_eq!(info.target.as_ref().unwrap().host, "target.example");
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("Nullgate CLIENT_TRANSPORT_ERROR origin=client")
+                );
+            } else {
+                assert!(failure.error_info().is_none());
+            }
+            assert_eq!(failure.source().is_some(), negotiated && failed);
+            assert!(!format!("{error} {error:?}").contains("private-"));
+            let mut chain: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            while let Some(source) = chain {
+                assert!(!format!("{source} {source:?}").contains("private-"));
+                chain = source.source();
+            }
+            if negotiated && failed {
+                assert_eq!(
+                    failure
+                        .target_error()
+                        .unwrap()
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                );
+                assert!(error.target_error().unwrap().is::<std::io::Error>());
+            } else {
+                assert!(error.target_error().is_none());
+            }
+            session.close().await.unwrap_err();
+            sdk.close().await.unwrap_err();
+            service.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_cause_requires_explicit_matching_command() {
+    for (code, origin, command_id, second_fails, expected) in [
+        (
+            "CLIENT_TRANSPORT_ERROR",
+            "client",
+            Some(1),
+            true,
+            Some(std::io::ErrorKind::TimedOut),
+        ),
+        (
+            "CLIENT_TRANSPORT_ERROR",
+            "client",
+            Some(2),
+            true,
+            Some(std::io::ErrorKind::ConnectionRefused),
+        ),
+        ("CLIENT_TRANSPORT_ERROR", "client", Some(2), false, None),
+        ("CLIENT_TRANSPORT_ERROR", "service", Some(1), true, None),
+        ("UPSTREAM_ERROR", "client", Some(1), true, None),
+        ("CLIENT_TRANSPORT_ERROR", "client", None, true, None),
+        ("CLIENT_TRANSPORT_ERROR", "client", Some(3), true, None),
+        ("CLIENT_TRANSPORT_ERROR", "client", Some(0), true, None),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let service = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            receive(&mut socket).await;
+            send(&mut socket, json!({"type":"hello", "state_id":"continued", "request_id":REQUEST_ID, "error_format":1})).await;
+            for id in 1..=2 {
+                send(
+                    &mut socket,
+                    json!({"type":"http", "id":id, "request":{
+                        "role":"tags", "url":format!("https://target.example/{id}"), "method":"GET",
+                        "headers":{}, "body":null, "credentials":"include"
+                    }}),
+                )
+                .await;
+            }
+            for _ in 0..2 {
+                let reply = receive(&mut socket).await;
+                if reply["id"] == 2 && !second_fails {
+                    assert_eq!(reply["type"], "http.result");
+                    assert_eq!(reply["response"]["status"], 502);
+                } else {
+                    assert_eq!(reply["type"], "http.error");
+                }
+            }
+            let mut info =
+                json!({"code":code, "origin":origin, "message":"safe", "retryable":null});
+            if let Some(id) = command_id {
+                info["command_id"] = json!(id);
+            }
+            send(&mut socket, json!({"type":"error", "status":502, "detail":"safe", "request_id":REQUEST_ID, "error":info})).await;
+            expect_close_without_departure(&mut socket).await;
+        });
+        let sdk = client(&base);
+        let mut session = session(&sdk);
+        let target = Target::new(
+            move |request| async move {
+                if request.url.ends_with("/1") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "private-first",
+                    ));
+                }
+                if second_fails {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "private-second",
+                    ));
+                }
+                Ok(TargetResponse {
+                    status: 502,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            },
+            None,
+        )
+        .unwrap();
+        let error = session.profile(params(), target).await.unwrap_err();
+        assert!(matches!(error, Error::Profile(_)));
+        assert_eq!(
+            error
+                .target_error()
+                .map(|source| source.downcast_ref::<std::io::Error>().unwrap().kind()),
+            expected
+        );
+        let mut chain: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        while let Some(source) = chain {
+            assert!(!format!("{source} {source:?}").contains("private-"));
+            chain = source.source();
+        }
+        session.close().await.unwrap_err();
+        sdk.close().await.unwrap_err();
+        service.await.unwrap();
+    }
+}

@@ -48,6 +48,8 @@ async fn generate(html: String, script: String) -> Result<(), Box<dyn std::error
         solution.wait().await?;
         // POST solution.body() unchanged to solution.url(), with solution.headers().
     }
+    session.close().await?;
+    client.close().await?;
     Ok(())
 }
 ```
@@ -72,6 +74,11 @@ for each new document. ThreatMetrix can start a new document profile on the same
 session to preserve its service continuation. In either case create a new `Page`
 for each document, and reuse the identity and target provider's cookie jar across
 navigation; never reuse document state for a different page.
+
+`X-State-ID` is SDK-managed server continuation, not the document ID, browser
+UUID or target cookie. Never share live state across unrelated documents/workers.
+Close profiles before sessions and the reusable client; close your caller-owned
+target HTTP client separately.
 
 `Error::Api` exposes status, server detail, and the response request ID through accessors. Debug/Display omit raw service detail, keys, HTML, scripts, and cookies. Malformed successful responses return `Error::Protocol`; no default solution is invented. Reports contain only `{request_id}`, use a three-second timeout, and never send API authentication, state, or target cookies. Redirects/retries are disabled. Cancellation is ordinary future cancellation, not successful delivery.
 
@@ -226,6 +233,74 @@ the updated cookies and solve again in the same document session.
 gate, not website acceptance. A new document needs a fresh session. Report an
 observed rejection with `solution.report().await?`; it sends only the request ID
 and makes no refund or acceptance promise.
+
+## Error handling and sensor stop semantics
+
+`Error::Api` and `Error::Profile` retain their status, detail and request-ID
+accessors, and expose optional typed `ErrorInfo` through `error_info()`.
+`ErrorInfo`, `ErrorTarget` and `TransportCause` are public models:
+
+```rust
+use nullgate_sdk::Error;
+
+fn describe_service_error(error: &Error) {
+    let (info, request_id) = match error {
+        Error::Api(api) => (api.error_info(), api.request_id()),
+        Error::Profile(profile) => (profile.error_info(), profile.request_id()),
+        _ => return,
+    };
+    eprintln!("request_id={request_id:?}");
+    if let Some(info) = info {
+        eprintln!("code={} origin={} stage={:?}", info.code, info.origin, info.stage);
+        if let Some(target) = &info.target {
+            eprintln!("{} {} {}", target.role, target.method, target.host);
+        }
+        if let Some(cause) = &info.cause {
+            eprintln!("cause_kind={}", cause.kind);
+        }
+    }
+}
+```
+
+Call this for solve/profile service errors and handle other variants separately.
+`CLIENT_TRANSPORT_ERROR` (`origin="client"`, `stage="target_http"`) means the
+ThreatMetrix SDK sent `http.error`: your callback could not return a valid target
+response. Compatibility status `502` is **not HTTP 502 received from the target**
+or proof of a Nullgate outage. Known typed local causes are available privately
+through `error.target_error()` only when metadata identifies the matching failed
+command. The standard `source()` chain is safe to print; the explicit raw accessor
+is not. Generic callback errors and legacy/missing command metadata may remain
+unknown. Do not log raw target errors.
+Return actual target `4xx`/`5xx` responses and raw bytes; do not call `error_for_status`.
+SDK → Nullgate transport and genuine service/upstream failures remain distinct.
+
+New SDKs request `X-Nullgate-Error-Format: 1`; enriched profiling `http.error`
+requires the service's confirmation. Old clients keep the unchanged legacy wire.
+New SDKs work with old servers with `None` metadata: fall back to status/request
+ID, never infer this code from an untyped `502`. Unknown codes/causes are valid.
+Nullable `retryable` is a hint, not automatic retry. Check page/source/params
+pairing for invalid or unsupported inputs; discovery does not prove support.
+Lost responses may follow completed billable work; do not blindly replay it.
+
+For support, share SDK version, operation, UTC time, request ID, status, available
+code/origin/stage, safe target role/method/host and cause kind/type/code. Never
+post keys, cookies, state IDs, proxy credentials, HAR files, private URLs,
+HTML/scripts, field values/hashes, generated bodies, raw detail or exceptions.
+See [diagnostics](https://docs.nullgate.club/en/diagnostics).
+
+Four sends do not guarantee `_abck` threshold `0`. `akamai::is_enough` tests the
+ordinary-send stop gate only; threshold `0` means stop, not acceptance or
+successful credentials. Count completed target sensor responses in the current
+cookie generation, not solves; reset on a new nonnegative generation. An unknown
+limit is not success. For explicit manual send-count experiments, construct
+`SensorParams::new(sensor, script)?.cookies(cookies)` with the current snapshot
+and call `session.solve(params).await?` in the same document, await
+`solution.wait()`, POST the exact result through your target client, read the
+response and refresh cookies before continuing. Recreate params with the same
+document protection and source as needed. This application-owned loop is not a
+`send_count` option, hidden retry or change to the normal cookie gate. Extra sends
+are not promised to help. Generation, POST completion and target acceptance are
+separate; even `200` may contain a block page.
 
 ## Quality and package checks
 

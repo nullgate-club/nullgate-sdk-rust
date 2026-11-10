@@ -345,6 +345,9 @@ pub(crate) async fn begin(
     request
         .headers_mut()
         .insert("X-State-ID", connection.state_id);
+    request
+        .headers_mut()
+        .insert("X-Nullgate-Error-Format", HeaderValue::from_static("1"));
     let observed_at_ms = wall_clock_ms()?;
     let opening = async {
         let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
@@ -390,23 +393,26 @@ pub(crate) async fn begin(
             ServerMessage::Hello {
                 state_id,
                 request_id,
+                error_format,
             } => {
                 if Uuid::parse_str(&request_id).is_err() || state_id.is_empty() {
                     return Err(protocol("malformed profile hello", None));
                 }
                 let state = HeaderValue::from_str(&state_id)
                     .map_err(|_| protocol("malformed profile state ID", Some(&request_id)))?;
-                Ok((socket, state, request_id))
+                Ok((socket, state, request_id, error_format == Some(1)))
             }
             ServerMessage::Failure {
                 status,
                 detail,
                 request_id,
-            } => Err(service_error(status, detail, request_id, None)?),
+                error,
+            } => Err(service_error(status, detail, request_id, None)?
+                .with_error_info(crate::ErrorInfo::parse(error))),
             _ => Err(protocol("expected profile hello", None)),
         }
     };
-    let (socket, state_id, request_id) = tokio::select! {
+    let (socket, state_id, request_id, error_format) = tokio::select! {
         biased;
         _ = connection.cancel.cancelled() => return Err(closed(None).into()),
         _ = session_cancel.cancelled() => return Err(closed(None).into()),
@@ -438,6 +444,7 @@ pub(crate) async fn begin(
                 limit: connection.limit,
                 ready: Some(ready_tx),
                 collected: collected_tx,
+                error_format,
             },
         )
         .await;
@@ -472,6 +479,7 @@ struct Worker {
     limit: Duration,
     ready: Option<oneshot::Sender<Result<(), ProfileError>>>,
     collected: watch::Sender<bool>,
+    error_format: bool,
 }
 
 #[derive(Deserialize)]
@@ -481,6 +489,8 @@ enum ServerMessage {
     Hello {
         state_id: String,
         request_id: String,
+        #[serde(default)]
+        error_format: Option<u8>,
     },
     #[serde(rename = "http")]
     Http { id: i64, request: HttpRequest },
@@ -499,6 +509,8 @@ enum ServerMessage {
         status: u16,
         detail: Value,
         request_id: Option<String>,
+        #[serde(default)]
+        error: Option<Value>,
     },
 }
 
@@ -565,6 +577,7 @@ async fn run(
     let mut seen = HashSet::new();
     let mut releases = HashMap::new();
     let mut departure: Option<DepartureResult> = None;
+    let sources = Arc::new(StdMutex::new(HashMap::new()));
     let work = async {
         loop {
             tokio::select! {
@@ -593,6 +606,8 @@ async fn run(
                             let replies = replies.clone();
                             let cancel = operations_cancel.child_token();
                             let request_id = worker.id.clone();
+                            let sources = sources.clone();
+                            let error_format = worker.error_format;
                             operations.spawn(async move {
                                 let result = tokio::select! { biased; _ = cancel.cancelled() => return Ok(()), result = fetch(request) => result };
                                 let response = match result {
@@ -608,7 +623,14 @@ async fn run(
                                         }
                                         json!({"type":"http.result", "id":id, "response":{"status":response.status, "headers":response.headers, "body":STANDARD.encode(response.body), "received_at_ms":received_at_ms}})
                                     }
-                                    Err(()) => json!({"type":"http.error", "id":id, "detail":"Target request failed"}),
+                                    Err(failure) => {
+                                        if let Some(source) = failure.source {
+                                            sources.lock().unwrap_or_else(|error| error.into_inner()).insert(id, source);
+                                        }
+                                        let mut message = json!({"type":"http.error", "id":id, "detail":"Target request failed"});
+                                        if error_format { message["error"] = json!(failure.cause); }
+                                        message
+                                    },
                                 };
                                 let _ = replies.send(response);
                                 Ok(())
@@ -639,7 +661,13 @@ async fn run(
                             let reply = departure.take().ok_or_else(|| protocol("unexpected pagehide acknowledgement", Some(&worker.id)))?;
                             let _ = reply.send(Ok(()));
                         }
-                        ServerMessage::Failure { status, detail, request_id } => return Err(service_error(status, detail, request_id, Some(&worker.id))?),
+                        ServerMessage::Failure { status, detail, request_id, error } => {
+                            let failure = service_error(status, detail, request_id, Some(&worker.id))?.with_error_info(crate::ErrorInfo::parse(error));
+                            let source = failure.error_info().filter(|info| info.code == "CLIENT_TRANSPORT_ERROR" && info.origin == "client")
+                                .and_then(|info| info.command_id)
+                                .and_then(|id| sources.lock().unwrap_or_else(|error| error.into_inner()).remove(&id));
+                            return Err(failure.with_source(source));
+                        },
                         ServerMessage::Hello { .. } => return Err(protocol("duplicate profile hello", Some(&worker.id))),
                     }
                 }
@@ -665,6 +693,10 @@ async fn run(
             cleanup_error.get_or_insert(error);
         }
     }
+    sources
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
     let close_result = timeout(Duration::from_secs(3), socket.close(None)).await;
     let result = result
         .and_then(|()| cleanup_error.map_or(Ok(()), Err))
@@ -759,7 +791,8 @@ fn handshake_error(error: WebSocketError) -> ProfileError {
                     .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()))
             })
             .unwrap_or(Value::Null);
-        ProfileError::service(response.status().as_u16(), detail, request_id)
+        let info = crate::ErrorInfo::parse(detail.get("error").cloned());
+        ProfileError::service(response.status().as_u16(), detail, request_id).with_error_info(info)
     } else {
         transport("profile connection failed", None)
     }

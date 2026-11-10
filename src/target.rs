@@ -45,15 +45,20 @@ pub struct TargetResponse {
     pub body: Vec<u8>,
 }
 
-type Fetch = dyn Fn(TargetRequest) -> BoxFuture<'static, Result<TargetResponse, ()>> + Send + Sync;
+type Fetch = dyn Fn(
+        TargetRequest,
+    ) -> BoxFuture<'static, Result<TargetResponse, crate::error_info::TargetFailure>>
+    + Send
+    + Sync;
 
 /// Reusable caller-owned HTTP callback and explicit local TURN route.
 ///
 /// The callback must use the same User-Agent, cookie jar and route as the page
 /// request. For `Credentials::Omit`, override the request's cookie provider with
 /// a fresh provider jar; never clear or replace the caller's shared jar. Dropping
-/// the callback future must cancel its request. Callback errors are deliberately
-/// discarded rather than exposing proxy credentials or request contents.
+/// the callback future must cancel its request. Known reqwest and I/O failures
+/// remain available locally through the service error source; other callback
+/// error types retain the existing constructor bounds and report unknown.
 #[derive(Clone)]
 pub struct Target {
     pub(crate) fetch: Arc<Fetch>,
@@ -77,7 +82,11 @@ impl Target {
         Ok(Self {
             fetch: Arc::new(move |request| {
                 let future = fetch(request);
-                Box::pin(async move { future.await.map_err(|_| ()) })
+                Box::pin(async move {
+                    future
+                        .await
+                        .map_err(crate::error_info::TargetFailure::from_error)
+                })
             }),
             route,
         })

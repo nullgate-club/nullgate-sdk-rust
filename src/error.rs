@@ -1,5 +1,6 @@
 use std::{error::Error as StdError, fmt};
 
+use crate::{ErrorInfo, error_info::LocalSource};
 use serde_json::Value;
 
 /// A checked configuration, discovery, transport, service, or protocol failure.
@@ -42,7 +43,26 @@ pub struct ProfileError {
     status: Option<u16>,
     request_id: Option<String>,
     detail: Option<Value>,
+    error_info: Option<Box<ErrorInfo>>,
+    source: Option<SafeTargetSource>,
 }
+
+#[derive(Clone)]
+struct SafeTargetSource(LocalSource);
+
+impl fmt::Debug for SafeTargetSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Target transport failed")
+    }
+}
+
+impl fmt::Display for SafeTargetSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Target transport failed")
+    }
+}
+
+impl StdError for SafeTargetSource {}
 
 impl ProfileError {
     pub(crate) fn new(
@@ -56,6 +76,8 @@ impl ProfileError {
             status: None,
             request_id,
             detail: None,
+            error_info: None,
+            source: None,
         }
     }
 
@@ -66,6 +88,8 @@ impl ProfileError {
             status: Some(status),
             request_id,
             detail: Some(detail),
+            error_info: None,
+            source: None,
         }
     }
 
@@ -100,6 +124,26 @@ impl ProfileError {
     pub fn detail(&self) -> Option<&Value> {
         self.detail.as_ref()
     }
+
+    /// Optional validated service metadata; legacy servers leave this absent.
+    pub fn error_info(&self) -> Option<&ErrorInfo> {
+        self.error_info.as_deref()
+    }
+    /// Original private target exception, excluded from the printable source chain.
+    /// Its text may contain URLs or credentials; inspect it explicitly, never log it blindly.
+    pub fn target_error(&self) -> Option<&(dyn StdError + Send + Sync + 'static)> {
+        self.source.as_ref().map(|source| source.0.as_ref())
+    }
+
+    pub(crate) fn with_error_info(mut self, info: Option<ErrorInfo>) -> Self {
+        self.error_info = info.map(Box::new);
+        self
+    }
+
+    pub(crate) fn with_source(mut self, source: Option<LocalSource>) -> Self {
+        self.source = source.map(SafeTargetSource);
+        self
+    }
 }
 
 impl fmt::Debug for ProfileError {
@@ -109,13 +153,23 @@ impl fmt::Debug for ProfileError {
             .field("message", &self.message)
             .field("status", &self.status)
             .field("request_id", &self.request_id)
+            .field("error_info", &self.error_info)
             .finish_non_exhaustive()
     }
 }
 
 impl fmt::Display for ProfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Nullgate profile: {}", self.message)?;
+        if let Some(info) = &self.error_info {
+            write!(
+                f,
+                "Nullgate {} origin={}",
+                info.display_code(),
+                info.display_origin()
+            )?;
+        } else {
+            write!(f, "Nullgate profile: {}", self.message)?;
+        }
         if let Some(status) = self.status {
             write!(f, " (status={status})")?;
         }
@@ -126,7 +180,13 @@ impl fmt::Display for ProfileError {
     }
 }
 
-impl StdError for ProfileError {}
+impl StdError for ProfileError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn StdError + 'static))
+    }
+}
 
 /// Original service status, diagnostic request ID, and inspectable server detail.
 ///
@@ -136,6 +196,7 @@ pub struct ApiError {
     status: u16,
     detail: Value,
     request_id: Option<String>,
+    error_info: Option<Box<ErrorInfo>>,
 }
 
 impl ApiError {
@@ -144,6 +205,7 @@ impl ApiError {
             status,
             detail,
             request_id,
+            error_info: None,
         }
     }
 
@@ -160,6 +222,16 @@ impl ApiError {
     /// The actual `X-Request-ID` response header, if supplied.
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+
+    /// Optional validated service metadata; legacy servers leave this absent.
+    pub fn error_info(&self) -> Option<&ErrorInfo> {
+        self.error_info.as_deref()
+    }
+
+    pub(crate) fn with_error_info(mut self, info: Option<ErrorInfo>) -> Self {
+        self.error_info = info.map(Box::new);
+        self
     }
 }
 
@@ -194,13 +266,24 @@ impl fmt::Debug for ApiError {
         f.debug_struct("ApiError")
             .field("status", &self.status)
             .field("request_id", &self.request_id)
+            .field("error_info", &self.error_info)
             .finish_non_exhaustive()
     }
 }
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Nullgate HTTP {}", self.status)?;
+        if let Some(info) = &self.error_info {
+            write!(
+                f,
+                "Nullgate {} origin={} (status={})",
+                info.display_code(),
+                info.display_origin(),
+                self.status
+            )?;
+        } else {
+            write!(f, "Nullgate HTTP {}", self.status)?;
+        }
         if let Some(id) = &self.request_id {
             write!(f, " (request_id={id})")?;
         }
@@ -275,5 +358,25 @@ impl From<reqwest::Error> for Error {
 impl From<ProfileError> for Error {
     fn from(error: ProfileError) -> Self {
         Self::Profile(error)
+    }
+}
+
+impl Error {
+    /// Original private target exception for a profiling transport failure.
+    /// Its text may contain sensitive target or proxy information.
+    pub fn target_error(&self) -> Option<&(dyn StdError + Send + Sync + 'static)> {
+        match self {
+            Self::Profile(error) => error.target_error(),
+            _ => None,
+        }
+    }
+
+    /// Structured metadata for HTTP and profiling service failures.
+    pub fn error_info(&self) -> Option<&ErrorInfo> {
+        match self {
+            Self::Api(error) => error.error_info(),
+            Self::Profile(error) => error.error_info(),
+            _ => None,
+        }
     }
 }

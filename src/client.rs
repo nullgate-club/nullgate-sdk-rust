@@ -298,6 +298,7 @@ impl Session {
             .header(AUTHORIZATION, self.client.inner.authorization.clone())
             .header(USER_AGENT, self.user_agent.clone())
             .header("X-State-ID", self.state_id.clone())
+            .header("X-Nullgate-Error-Format", "1")
             .json(&params.payload(self.timezone.as_deref()));
         let response = request.send().await?;
         // Apply rotations before status/body validation: errors can rotate state too.
@@ -316,17 +317,16 @@ impl Session {
             let value = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_else(|_| {
                 serde_json::Value::String(String::from_utf8_lossy(&body).into_owned())
             });
+            let error_info = crate::ErrorInfo::parse(value.get("error").cloned());
             let detail = match value {
                 serde_json::Value::Object(mut object) => object
                     .remove("detail")
                     .unwrap_or(serde_json::Value::Object(object)),
                 value => value,
             };
-            return Err(Error::Api(ApiError::new(
-                status.as_u16(),
-                detail,
-                request_id,
-            )));
+            return Err(Error::Api(
+                ApiError::new(status.as_u16(), detail, request_id).with_error_info(error_info),
+            ));
         }
         let request_id = request_id.ok_or_else(|| {
             Error::Protocol(ProtocolError::new(

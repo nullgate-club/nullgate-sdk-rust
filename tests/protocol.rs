@@ -553,3 +553,44 @@ fn checked_values_fail_without_echoing_secrets() {
     send_sync::<nullgate_sdk::Session>();
     send_sync::<nullgate_sdk::Solution>();
 }
+
+#[tokio::test]
+async fn optional_error_metadata_preserves_legacy_and_future_service_errors() {
+    let replies = vec![
+        Reply::json(502, json!({"detail":"private-body"})),
+        Reply::json(502, json!({"detail":"private-body", "error":{"code":123}})),
+        Reply::json(
+            502,
+            json!({"detail":"private-body", "error":{
+                "code":"FUTURE_ERROR", "origin":"upstream", "message":"safe", "retryable":null
+            }}),
+        ),
+    ];
+    let mut server = serve(replies).await;
+    let sdk = NullgateClient::builder(KEY)
+        .base_url(&server.url)
+        .build()
+        .unwrap();
+    let mut session = sdk.open(SessionOptions::new(ID, "agent")).unwrap();
+    for index in 0..3 {
+        let error = session.solve(sensor()).await.unwrap_err();
+        let Error::Api(api) = &error else {
+            panic!("lost HTTP service error");
+        };
+        assert_eq!(api.status(), 502);
+        assert_eq!(api.detail(), &json!("private-body"));
+        if index == 2 {
+            assert_eq!(api.error_info().unwrap().code, "FUTURE_ERROR");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("Nullgate FUTURE_ERROR origin=upstream")
+            );
+        } else {
+            assert!(api.error_info().is_none());
+        }
+        assert!(!format!("{error} {error:?}").contains("private-body"));
+        let request = server.requests.recv().await.unwrap();
+        assert_eq!(request.headers["x-nullgate-error-format"], "1");
+    }
+}
