@@ -53,45 +53,6 @@ pub fn prepare_inputs(inputs: &[BTreeMap<String, String>]) -> Vec<PreparedInput>
         .iter()
         .map(|field| {
             let value = field.get("value").map_or("", String::as_str);
-            let mut digest = Sha256::new();
-            let mut length = 0;
-            let mut hash31 = 0_i32;
-            let mut trimmed_hash31 = 0_i32;
-            let mut trimmed_length = 0;
-            let mut candidate_hash = 0_i32;
-            let mut candidate_length = 0;
-            let mut trim_started = false;
-            for unit in value.encode_utf16() {
-                digest.update(unit.to_le_bytes());
-                length += 1;
-                hash31 = hash31.wrapping_mul(31).wrapping_add(i32::from(unit));
-                // ECMAScript trim characters are BMP; surrogate units are not whitespace.
-                let whitespace = char::from_u32(u32::from(unit)).is_some_and(js_whitespace);
-                if !whitespace {
-                    trim_started = true;
-                }
-                if trim_started {
-                    candidate_hash = candidate_hash
-                        .wrapping_mul(31)
-                        .wrapping_add(i32::from(unit));
-                    candidate_length += 1;
-                }
-                if !whitespace {
-                    trimmed_hash31 = candidate_hash;
-                    trimmed_length = candidate_length;
-                }
-            }
-            let special = value
-                .chars()
-                .filter(|ch| !ch.is_ascii_alphanumeric() && *ch != '_' && !js_whitespace(*ch))
-                .map(char::len_utf16)
-                .sum();
-            let letters = value
-                .chars()
-                .flat_map(char::to_lowercase)
-                .filter(char::is_ascii_lowercase)
-                .count();
-            let digits = value.chars().filter(char::is_ascii_digit).count();
             PreparedInput {
                 attributes: field
                     .iter()
@@ -99,17 +60,61 @@ pub fn prepare_inputs(inputs: &[BTreeMap<String, String>]) -> Vec<PreparedInput>
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
                 selector: field.get("selector").cloned(),
-                value: InputValue {
-                    length,
-                    hash: format!("{:x}", digest.finalize()),
-                    counts: [length, special, letters, digits],
-                    hash31: Some(hash31),
-                    trimmed_hash31: Some(trimmed_hash31),
-                    trimmed_length: Some(trimmed_length),
-                },
+                value: summarize_input(value),
             }
         })
         .collect()
+}
+
+/// Summarize one non-retained value using the same public input format.
+pub fn summarize_input(value: &str) -> InputValue {
+    let mut digest = Sha256::new();
+    let mut length = 0;
+    let mut hash31 = 0_i32;
+    let mut trimmed_hash31 = 0_i32;
+    let mut trimmed_length = 0;
+    let mut candidate_hash = 0_i32;
+    let mut candidate_length = 0;
+    let mut trim_started = false;
+    for unit in value.encode_utf16() {
+        digest.update(unit.to_le_bytes());
+        length += 1;
+        hash31 = hash31.wrapping_mul(31).wrapping_add(i32::from(unit));
+        // ECMAScript trim characters are BMP; surrogate units are not whitespace.
+        let whitespace = char::from_u32(u32::from(unit)).is_some_and(js_whitespace);
+        if !whitespace {
+            trim_started = true;
+        }
+        if trim_started {
+            candidate_hash = candidate_hash
+                .wrapping_mul(31)
+                .wrapping_add(i32::from(unit));
+            candidate_length += 1;
+        }
+        if !whitespace {
+            trimmed_hash31 = candidate_hash;
+            trimmed_length = candidate_length;
+        }
+    }
+    let special = value
+        .chars()
+        .filter(|ch| !ch.is_ascii_alphanumeric() && *ch != '_' && !js_whitespace(*ch))
+        .map(char::len_utf16)
+        .sum();
+    let letters = value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(char::is_ascii_lowercase)
+        .count();
+    let digits = value.chars().filter(char::is_ascii_digit).count();
+    InputValue {
+        length,
+        hash: format!("{:x}", digest.finalize()),
+        counts: [length, special, letters, digits],
+        hash31: Some(hash31),
+        trimmed_hash31: Some(trimmed_hash31),
+        trimmed_length: Some(trimmed_length),
+    }
 }
 
 /// Return the response limit and generation, with unavailable counters represented by -1.

@@ -15,6 +15,7 @@ use crate::{
 const BASE_URL: &str = "https://akamai.nullgate.club";
 const ANALYTICS_URL: &str = "https://analytics.nullgate.club";
 const PROFILE_URL: &str = "https://threatmetrix.nullgate.club";
+const AMAZON_URL: &str = "https://amazon.nullgate.club";
 
 /// A cheaply cloned handle to one reusable Nullgate API pool.
 ///
@@ -31,6 +32,7 @@ struct ClientInner {
     base_url: Url,
     report_url: Url,
     profile_url: Url,
+    amazon_url: Url,
     timeout: Duration,
     profile_tls: Arc<tokio_rustls::rustls::ClientConfig>,
     profiles: Profiles,
@@ -48,6 +50,7 @@ pub struct ClientBuilder {
     base_url: String,
     analytics_url: String,
     profile_base_url: String,
+    amazon_base_url: String,
     timeout: Duration,
     report_timeout: Duration,
 }
@@ -65,6 +68,7 @@ impl NullgateClient {
             base_url: BASE_URL.to_owned(),
             analytics_url: ANALYTICS_URL.to_owned(),
             profile_base_url: PROFILE_URL.to_owned(),
+            amazon_base_url: AMAZON_URL.to_owned(),
             timeout: Duration::from_secs(30),
             report_timeout: Duration::from_secs(3),
         }
@@ -86,6 +90,7 @@ impl NullgateClient {
             user_agent,
             timezone: options.timezone,
             state_id: new_state_id(),
+            amazon_state_id: new_state_id(),
             profiles: Profiles::default(),
         })
     }
@@ -153,6 +158,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Amazon origin/base path; independent of the existing generation endpoint.
+    pub fn amazon_base_url(mut self, value: impl Into<String>) -> Self {
+        self.amazon_base_url = value.into();
+        self
+    }
+
     /// Finite total timeout for generation requests.
     pub fn timeout(mut self, value: Duration) -> Self {
         self.timeout = value;
@@ -181,6 +192,7 @@ impl ClientBuilder {
             return Err(Error::Configuration("timeouts must be greater than zero"));
         }
         let base_url = service_base(&self.base_url)?;
+        let amazon_url = service_base(&self.amazon_base_url)?;
         let mut profile_url = service_base(&self.profile_base_url)?;
         let scheme = if profile_url.scheme() == "https" {
             "wss"
@@ -209,6 +221,7 @@ impl ClientBuilder {
                 base_url,
                 report_url,
                 profile_url,
+                amazon_url,
                 timeout: self.timeout,
                 profile_tls: crate::turn_transport::tls_config()
                     .map_err(|_| Error::Configuration("invalid profile TLS configuration"))?,
@@ -263,6 +276,7 @@ pub struct Session {
     user_agent: HeaderValue,
     timezone: Option<String>,
     state_id: HeaderValue,
+    amazon_state_id: HeaderValue,
     profiles: Profiles,
 }
 
@@ -290,51 +304,49 @@ impl Session {
             .map_err(|_| Error::Configuration("invalid generation endpoint"))?;
         url.query_pairs_mut()
             .append_pair("type", params.operation());
-        let request = self
+        let (response, request_id) = generate(
+            &self.client,
+            &self.user_agent,
+            &mut self.state_id,
+            url,
+            &params.payload(self.timezone.as_deref()),
+        )
+        .await?;
+        let body = response.bytes().await?;
+        Solution::from_response(self.client.clone(), &params, &body, request_id)
+    }
+
+    /// Amazon continuation, separate from Akamai/ThreatMetrix state.
+    pub fn amazon_state_id(&self) -> Option<&str> {
+        self.amazon_state_id.to_str().ok()
+    }
+
+    /// Generate metadata for the caller's form without sending a target request.
+    /// Dropping this future cancels generation; received rotations survive errors.
+    pub async fn fwcim(
+        &mut self,
+        params: &crate::FwcimParams,
+    ) -> Result<crate::FwcimSolution, Error> {
+        if self.profiles.cancel.is_cancelled() || self.client.inner.profiles.cancel.is_cancelled() {
+            return Err(profile::closed(None).into());
+        }
+        let mut url = self
             .client
             .inner
-            .http
-            .post(url)
-            .header(AUTHORIZATION, self.client.inner.authorization.clone())
-            .header(USER_AGENT, self.user_agent.clone())
-            .header("X-State-ID", self.state_id.clone())
-            .header("X-Nullgate-Error-Format", "1")
-            .json(&params.payload(self.timezone.as_deref()));
-        let response = request.send().await?;
-        // Apply rotations before status/body validation: errors can rotate state too.
-        if let Some(value) = response.headers().get("X-State-ID") {
-            self.state_id = value.clone();
-        }
-        let request_id = response
-            .headers()
-            .get("X-Request-ID")
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        let status = response.status();
+            .amazon_url
+            .join(&format!("v1/{}/generate", self.identity))
+            .map_err(|_| Error::Configuration("invalid Amazon generation endpoint"))?;
+        url.query_pairs_mut().append_pair("type", "fwcim");
+        let (response, request_id) = generate(
+            &self.client,
+            &self.user_agent,
+            &mut self.amazon_state_id,
+            url,
+            &params.payload(self.timezone.as_deref()),
+        )
+        .await?;
         let body = response.bytes().await?;
-        if !status.is_success() {
-            let value = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_else(|_| {
-                serde_json::Value::String(String::from_utf8_lossy(&body).into_owned())
-            });
-            let error_info = crate::ErrorInfo::parse(value.get("error").cloned());
-            let detail = match value {
-                serde_json::Value::Object(mut object) => object
-                    .remove("detail")
-                    .unwrap_or(serde_json::Value::Object(object)),
-                value => value,
-            };
-            return Err(Error::Api(
-                ApiError::new(status.as_u16(), detail, request_id).with_error_info(error_info),
-            ));
-        }
-        let request_id = request_id.ok_or_else(|| {
-            Error::Protocol(ProtocolError::new(
-                "missing or malformed X-Request-ID header",
-                None,
-            ))
-        })?;
-        Solution::from_response(self.client.clone(), &params, &body, request_id)
+        crate::FwcimSolution::from_response(&body, request_id)
     }
 
     /// Begin profiling the original document on the caller's own target network.
@@ -435,4 +447,109 @@ fn service_base(value: &str) -> Result<Url, Error> {
     let path = format!("{}/", url.path().trim_end_matches('/'));
     url.set_path(&path);
     Ok(url)
+}
+
+async fn generate(
+    client: &NullgateClient,
+    user_agent: &HeaderValue,
+    state_id: &mut HeaderValue,
+    url: Url,
+    payload: &impl Serialize,
+) -> Result<(reqwest::Response, String), Error> {
+    let request = client
+        .inner
+        .http
+        .post(url)
+        .header(AUTHORIZATION, client.inner.authorization.clone())
+        .header(USER_AGENT, user_agent.clone())
+        .header("X-State-ID", state_id.clone())
+        .header("X-Nullgate-Error-Format", "1")
+        .json(payload)
+        .build()?;
+    let started = tokio::time::Instant::now();
+    for attempt in 0..=2 {
+        if client.inner.profiles.cancel.is_cancelled() {
+            return Err(profile::closed(None).into());
+        }
+        let mut request = request
+            .try_clone()
+            .expect("JSON generation request is cloneable");
+        *request.timeout_mut() = Some(client.inner.timeout.saturating_sub(started.elapsed()));
+        let response = client.inner.http.execute(request).await?;
+        let rotation = response.headers().get("X-State-ID").cloned();
+        let request_id = response
+            .headers()
+            .get("X-Request-ID")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let status = response.status();
+        let retry_delay = maintenance_delay(status.as_u16(), response.headers());
+        // Headers own continuation even when the response body cannot be read.
+        if retry_delay.is_none()
+            && let Some(value) = rotation
+        {
+            *state_id = value;
+        }
+        if status.is_success() {
+            let request_id = request_id.ok_or_else(|| {
+                Error::Protocol(ProtocolError::new(
+                    "missing or malformed X-Request-ID header",
+                    None,
+                ))
+            })?;
+            return Ok((response, request_id));
+        }
+        if attempt < 2
+            && let Some(delay) = retry_delay
+            && delay < client.inner.timeout.saturating_sub(started.elapsed())
+        {
+            drop(response);
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = client.inner.profiles.cancel.cancelled() => {
+                    return Err(profile::closed(request_id.as_deref()).into());
+                }
+            }
+            continue;
+        }
+        let body = response.bytes().await?;
+        let value = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&body).into_owned())
+        });
+        let error_info = crate::ErrorInfo::parse(value.get("error").cloned());
+        let detail = match value {
+            serde_json::Value::Object(mut object) => object
+                .remove("detail")
+                .unwrap_or(serde_json::Value::Object(object)),
+            value => value,
+        };
+        return Err(Error::Api(
+            ApiError::new(status.as_u16(), detail, request_id).with_error_info(error_info),
+        ));
+    }
+    unreachable!("the final attempt returns its response")
+}
+
+pub(crate) fn maintenance_delay(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Duration> {
+    if status != 503 {
+        return None;
+    }
+    let mut markers = headers.get_all("X-Nullgate-Maintenance").iter();
+    if markers.next()?.as_bytes() != b"1" || markers.next().is_some() {
+        return None;
+    }
+    let mut delays = headers.get_all("Retry-After").iter();
+    let delay = delays.next()?.to_str().ok()?;
+    if delays.next().is_some() {
+        return None;
+    }
+    delay
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (0.0..=5.0).contains(value))
+        .map(Duration::from_secs_f64)
 }

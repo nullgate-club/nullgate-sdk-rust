@@ -350,14 +350,34 @@ pub(crate) async fn begin(
         .insert("X-Nullgate-Error-Format", HeaderValue::from_static("1"));
     let observed_at_ms = wall_clock_ms()?;
     let opening = async {
-        let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(Connector::Rustls(connection.tls)),
-        )
-        .await
-        .map_err(handshake_error)?;
+        let mut attempt = 0;
+        let mut socket = loop {
+            match tokio_tungstenite::connect_async_tls_with_config(
+                request.clone(),
+                None,
+                false,
+                Some(Connector::Rustls(connection.tls.clone())),
+            )
+            .await
+            {
+                Ok((socket, _)) => break socket,
+                Err(WebSocketError::Http(response)) => {
+                    let delay = crate::client::maintenance_delay(
+                        response.status().as_u16(),
+                        response.headers(),
+                    );
+                    if attempt < 2
+                        && let Some(delay) = delay
+                    {
+                        attempt += 1;
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        return Err(handshake_error(WebSocketError::Http(response)));
+                    }
+                }
+                Err(error) => return Err(handshake_error(error)),
+            }
+        };
         let protection = params.protection();
         let page = protection.page();
         let mut start = json!({

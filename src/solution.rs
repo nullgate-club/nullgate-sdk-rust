@@ -137,29 +137,7 @@ impl Solution {
     /// Wait until the absolute send deadline; an elapsed deadline returns immediately.
     /// Dropping the future cancels the wait.
     pub async fn wait(&self) -> Result<(), Error> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| Error::Configuration("system clock is before the Unix epoch"))?
-            .as_secs_f64();
-        let delay = self.send_at - now;
-        if delay > 0.0 {
-            let duration = Duration::try_from_secs_f64(delay).map_err(|_| {
-                Error::Protocol(ProtocolError::new(
-                    "send_at delay is not representable",
-                    Some(self.request_id.clone()),
-                ))
-            })?;
-            let deadline = tokio::time::Instant::now()
-                .checked_add(duration)
-                .ok_or_else(|| {
-                    Error::Protocol(ProtocolError::new(
-                        "send_at delay is not representable",
-                        Some(self.request_id.clone()),
-                    ))
-                })?;
-            tokio::time::sleep_until(deadline).await;
-        }
-        Ok(())
+        wait_until(self.send_at, &self.request_id).await
     }
 
     /// Report a target rejection through the originating client's analytics endpoint.
@@ -177,4 +155,26 @@ impl fmt::Debug for Solution {
             .field("request_id", &self.request_id)
             .finish_non_exhaustive()
     }
+}
+
+pub(crate) async fn wait_until(send_at: f64, request_id: &str) -> Result<(), Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Configuration("system clock is before the Unix epoch"))?
+        .as_secs_f64();
+    let delay = send_at - now;
+    if delay > 0.0 {
+        let invalid = || {
+            Error::Protocol(ProtocolError::new(
+                "send_at delay is not representable",
+                Some(request_id.to_owned()),
+            ))
+        };
+        let duration = Duration::try_from_secs_f64(delay).map_err(|_| invalid())?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(duration)
+            .ok_or_else(invalid)?;
+        tokio::time::sleep_until(deadline).await;
+    }
+    Ok(())
 }

@@ -13,6 +13,7 @@ use crate::Error;
 #[derive(Clone)]
 pub struct Page(Arc<PageData>);
 
+#[derive(Clone)]
 struct PageData {
     url: Url,
     html: String,
@@ -51,9 +52,20 @@ impl Page {
         self.0.document_id
     }
 
-    /// Acquisition time in UTC Unix milliseconds, preserved with the document.
+    /// Construction time in UTC Unix milliseconds, preserved with the document.
     pub fn started_at_ms(&self) -> u64 {
         self.0.started_at_ms
+    }
+
+    /// Use an actual caller-observed document identity and navigation start.
+    ///
+    /// This does not measure browser timing. Clones retain the supplied context.
+    pub fn with_document_context(self, document_id: Uuid, started_at_ms: u64) -> Self {
+        let mut page = self;
+        let data = Arc::make_mut(&mut page.0);
+        data.document_id = document_id;
+        data.started_at_ms = started_at_ms;
+        page
     }
 }
 

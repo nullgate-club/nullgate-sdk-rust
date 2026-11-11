@@ -20,6 +20,8 @@ pub struct Reply {
     pub headers: Vec<(String, String)>,
     pub body: String,
     pub delay: Duration,
+    pub body_delay: Duration,
+    pub body_length: Option<usize>,
 }
 
 impl Reply {
@@ -29,6 +31,8 @@ impl Reply {
             headers: Vec::new(),
             body: body.to_string(),
             delay: Duration::ZERO,
+            body_delay: Duration::ZERO,
+            body_length: None,
         }
     }
 
@@ -114,13 +118,14 @@ pub async fn serve(replies: Vec<Reply>) -> Server {
                 .map(|(name, value)| format!("{name}: {value}\r\n"))
                 .collect::<String>();
             let response = format!(
-                "HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                "HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
                 reply.status,
-                reply.body.len(),
+                reply.body_length.unwrap_or(reply.body.len()),
                 headers,
-                reply.body
             );
             let _ = stream.write_all(response.as_bytes()).await;
+            tokio::time::sleep(reply.body_delay).await;
+            let _ = stream.write_all(reply.body.as_bytes()).await;
         }
     });
     Server {

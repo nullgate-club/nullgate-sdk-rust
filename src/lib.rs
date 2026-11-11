@@ -32,6 +32,7 @@
 //! explicitly, and await `close` for resource cleanup without invented departure.
 
 pub mod akamai;
+mod amazon;
 mod client;
 mod discovery;
 mod error;
@@ -43,6 +44,7 @@ mod solution;
 mod target;
 mod turn_transport;
 
+pub use amazon::{FwcimGeometry, FwcimInput, FwcimParams, FwcimSolution};
 pub use client::{ClientBuilder, NullgateClient, Session, SessionOptions};
 pub use discovery::{FindOptions, find_protections, find_protections_with_options};
 pub use error::{ApiError, Error, ProfileError, ProfileErrorKind, ProtocolError};

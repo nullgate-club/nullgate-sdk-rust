@@ -1,8 +1,9 @@
 # Nullgate Rust SDK
 
-An asynchronous, typed client for Nullgate's Akamai Pixel, Sensor and SBSD generation APIs and active ThreatMetrix profiling. The SDK contacts Nullgate; your target HTTP transport, proxy and cookie jar remain yours.
+An asynchronous, typed client for Nullgate's Akamai Pixel, Sensor and SBSD generation APIs, Amazon FWCIM metadata, and active ThreatMetrix profiling. The SDK contacts Nullgate; your target HTTP transport, proxy and cookie jar remain yours.
 
-The default endpoints are `https://akamai.nullgate.club` for generation,
+The default endpoints are `https://akamai.nullgate.club` for Akamai generation,
+`https://amazon.nullgate.club` for Amazon FWCIM,
 `https://threatmetrix.nullgate.club` for profiling, and
 `https://analytics.nullgate.club` for optional diagnostic reports.
 
@@ -80,7 +81,103 @@ UUID or target cookie. Never share live state across unrelated documents/workers
 Close profiles before sessions and the reusable client; close your caller-owned
 target HTTP client separately.
 
-`Error::Api` exposes status, server detail, and the response request ID through accessors. Debug/Display omit raw service detail, keys, HTML, scripts, and cookies. Malformed successful responses return `Error::Protocol`; no default solution is invented. Reports contain only `{request_id}`, use a three-second timeout, and never send API authentication, state, or target cookies. Redirects/retries are disabled. Cancellation is ordinary future cancellation, not successful delivery.
+`Error::Api` exposes status, server detail, and the response request ID through accessors. Debug/Display omit raw service detail, keys, HTML, scripts, and cookies. Malformed successful responses return `Error::Protocol`; no default solution is invented. Reports contain only `{request_id}`, use a three-second timeout, and never send API authentication, state, or target cookies. Redirects and generic retries are disabled; the narrow pre-work maintenance exception is described below. Cancellation is ordinary future cancellation, not successful delivery.
+
+## Amazon FWCIM
+
+Call `session.fwcim(&params).await?` directly; no `Protection`, script discovery,
+JavaScript source, collector, renderer, proof-of-work, or login implementation is
+included. `.amazon_base_url(...)` on the client builder changes only the Amazon
+endpoint. The session reuses its identity, user agent and timezone but maintains
+independent Amazon continuation (`amazon_state_id()`), including error rotations.
+Reuse a `Page` for the same document, and create a new one on navigation.
+
+The encoding line below uses the optional caller-side `url` crate (`cargo add url`).
+
+```rust,no_run
+use std::collections::BTreeMap;
+use nullgate_sdk::{FwcimInput, FwcimParams, Page, Session};
+use uuid::Uuid;
+
+async fn amazon_form(
+    session: &mut Session,
+    html_without_password_values: String,
+    document_id: Uuid,
+    observed_timing: BTreeMap<String, u64>,
+    email: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Actual caller observations, not synthetic browser measurements.
+    let navigation_start = *observed_timing.get("navigationStart")
+        .ok_or("missing observed navigationStart")?;
+    let page = Page::new("https://www.amazon.com/ap/signin", html_without_password_values)?
+        .with_document_context(document_id, navigation_start);
+    let email = FwcimInput::new(
+        &page,
+        BTreeMap::from([("name".into(), "email".into())]),
+        Some("#signInForm input[name='email']"),
+        email,
+        false, // Do not transmit optional canvas text.
+    )?;
+    let params = FwcimParams::new(page, observed_timing)?
+        .form_selector("#signInForm")?
+        .inputs(vec![email])?;
+    let solution = session.fwcim(&params).await?;
+    solution.wait().await?;
+    let encoded_metadata_field = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("metadata1", solution.metadata1())
+        .finish();
+    // Insert raw metadata1 into your complete form, then URL-encode ONCE.
+    // Use solution.headers(); caller owns HTTP, cookies and password encryption.
+    drop(encoded_metadata_field);
+    Ok(())
+}
+```
+
+`Page::new` records construction time, not measured navigation time. When an
+actual document began earlier, `.with_document_context(document_id,
+observed_navigation_start)` retains the caller's observations; clones preserve
+them. Required `performance_timing.navigationStart` must be positive and equal the page start.
+Other nonzero timings cannot precede navigation start; zero remains unknown.
+Input observations must match the page's document ID, URL, HTML and start timestamp.
+No timing or geometry is invented.
+
+`FwcimInput::new` checks the real selected `input`/`textarea` using CSS selectors,
+requires unambiguous matching and confirms any supplied `id`/`name`. Other
+attributes are rejected. Password observations and nonempty password values in
+HTML are rejected locally before API transport, without echoing the value.
+The check includes nonempty duplicate `value` attributes that DOM parsing normally ignores.
+Form/input selection excludes inert template content, but the password guard still checks it.
+This check recognizes trimmed, case-insensitive `type=password`, autocomplete
+tokens `current-password`/`new-password`, and canonical `id`/`name` values
+`password`/`ap_password`. Ordinary nonpassword HTML and explicit canvas text remain allowed.
+An explicit form selector must select exactly one FORM, and observed inputs must
+be its descendants, regardless of builder-call order. The native collector uses
+descendants, not HTML form ownership: an external `form`-associated control is
+excluded, while a descendant's `form` attribute does not change membership.
+Nonpassword values use the existing redacted UTF-16 summaries and a separate
+standard CRC32 checksum over CESU-8 bytes. The final boolean explicitly opts into
+sending nonpassword canvas text. `.geometry(...)` accepts actual bounds only.
+Inputs/actions may be omitted; explicit empty lists remain distinct. Actions are
+checked against the public field and nested numeric shapes, and input summaries
+use `[length, counts-or-null]`; arbitrary nested objects and raw input/change text
+are rejected. Touch points require finite, non-null `x` and `y`; negative coordinates
+are allowed. An optional `identifier` must be an integer. Motion vectors remain
+null or three nullable finite numbers. `metadata1` is hidden from `Debug`, but is
+sensitive data: do not log it. The SDK never sends credentials or logs into Amazon.
+
+Amazon solutions retain `request_id` for correlation; Amazon diagnostic report
+delivery is not supported.
+
+Generation transparently retries at most twice only for HTTP 503 with
+`X-Nullgate-Maintenance: 1` and a finite `Retry-After` from zero to five seconds.
+Only those headers establish pre-work maintenance; response bodies are not read
+to decide whether to retry. It honors the delay within the existing total timeout,
+does not accept state rotations from maintenance, and cancels waits on client
+close or future drop. Other status codes, unmarked 503s, transport failures and
+target HTTP are not retried. Nonmaintenance state rotations are retained as soon
+as headers arrive, even if reading the body fails or is cancelled. ThreatMetrix
+opening HTTP denials use the same bounded header-only policy before a socket opens.
+
 
 Discovery is local and synchronous. `find_protections(&page)?` returns an empty
 list for no match, a single-element list for one match, and

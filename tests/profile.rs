@@ -776,3 +776,125 @@ async fn target_cause_requires_explicit_matching_command() {
         service.await.unwrap();
     }
 }
+
+async fn deny_opening(
+    stream: &mut TcpStream,
+    detail: &str,
+    marker: Option<&str>,
+    retry_after: Option<&str>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = Vec::new();
+    loop {
+        let mut buffer = [0_u8; 1024];
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert_ne!(read, 0);
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|part| part == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let body = json!({"detail":detail}).to_string();
+    let retry_after = retry_after
+        .map(|value| format!("Retry-After: {value}\r\n"))
+        .unwrap_or_default();
+    let marker = marker
+        .map(|value| format!("X-Nullgate-Maintenance: {value}\r\n"))
+        .unwrap_or_default();
+    stream.write_all(format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\nX-State-ID: must-not-rotate\r\n{marker}{retry_after}\r\n{body}",
+        body.len(),
+    ).as_bytes()).await.unwrap();
+}
+
+#[tokio::test]
+async fn handshake_retries_only_exact_prework_maintenance_and_is_bounded() {
+    for (detail, marker, delay, attempts) in [
+        (
+            "Service updating; retry after a short delay",
+            Some("1"),
+            Some("0"),
+            3,
+        ),
+        ("busy", Some("1"), Some("0"), 3),
+        (
+            "Service updating; retry after a short delay",
+            None,
+            Some("0"),
+            1,
+        ),
+        (
+            "Service updating; retry after a short delay",
+            Some("0"),
+            Some("0"),
+            1,
+        ),
+        (
+            "Service updating; retry after a short delay",
+            Some("1"),
+            None,
+            1,
+        ),
+        (
+            "Service updating; retry after a short delay",
+            Some("1"),
+            Some("6"),
+            1,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sdk = client(&format!("http://{}", listener.local_addr().unwrap()));
+        let service = tokio::spawn(async move {
+            for _ in 0..attempts {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                deny_opening(&mut stream, detail, marker, delay).await;
+            }
+            assert!(
+                timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let mut session = session(&sdk);
+        let state = session.state_id().unwrap().to_owned();
+        let target = Target::new(|_| async { Err::<TargetResponse, _>(()) }, None).unwrap();
+        assert!(matches!(
+            session.profile(params(), target).await,
+            Err(Error::Profile(_))
+        ));
+        assert_eq!(session.state_id(), Some(state.as_str()));
+        service.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn client_close_cancels_handshake_maintenance_wait() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sdk = client(&format!("http://{}", listener.local_addr().unwrap()));
+    let (denied, denial) = tokio::sync::oneshot::channel();
+    let service = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        deny_opening(
+            &mut stream,
+            "Service updating; retry after a short delay",
+            Some("1"),
+            Some("5"),
+        )
+        .await;
+        denied.send(()).unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let mut session = session(&sdk);
+    let target = Target::new(|_| async { Err::<TargetResponse, _>(()) }, None).unwrap();
+    let close = async {
+        denial.await.unwrap();
+        sdk.close().await.unwrap();
+    };
+    let (result, ()) = tokio::join!(session.profile(params(), target), close);
+    assert!(matches!(result, Err(Error::Profile(_))));
+    service.await.unwrap();
+}
